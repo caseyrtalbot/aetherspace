@@ -22,14 +22,23 @@ up). All visual identity lives in `src/theme.rs`, so re-theming is a one-file ed
 | Key | Action |
 |-----|--------|
 | `Tab` | Cycle focus: Projects -> Viewer -> Shell (global, works from anywhere) |
+| `Ctrl+z` | Zoom: the shell fills the frame; press again to restore (global) |
 | `j` / `k` or arrows | Move selection (Projects) or scroll (Viewer) |
 | `PageUp` / `PageDown` | Scroll the viewer faster |
+| `PageUp` (shell focused) | Enter scrollback view; arrows / `PageUp` / `PageDown` move it, `Esc` or any key returns to live |
 | `q` / `Esc` | Quit (when the shell is not focused) |
 
-When the shell is focused, keystrokes go to the real shell, with one exception:
-`Tab` always cycles focus, so you can never get trapped in the shell. The
-tradeoff is that the embedded shell does not receive `Tab`, so shell
-tab-completion is unavailable. A future capture mode will restore it.
+When the shell is focused, keystrokes go to the real shell, with two global
+exceptions: `Tab` always cycles focus and `Ctrl+z` always toggles zoom, so you
+can never get trapped in the shell. The tradeoff is that the embedded shell
+receives neither key, so shell tab-completion is unavailable and `Ctrl+z`
+job-control suspend does not reach the embedded shell. A future capture mode
+will restore them.
+
+Scrollback only applies to programs on the primary buffer (a plain shell, `git
+log`, `claude`); alternate-screen programs (`vim`, `less`, `fzf`, `lazygit`)
+keep their own paging, so `PageUp` passes straight through to them — use zoom
+for those instead.
 
 ## Stack
 

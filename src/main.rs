@@ -26,7 +26,7 @@ use config::Project;
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Alignment, Constraint, Direction, Layout, Rect, Spacing},
     style::{Modifier, Style},
     text::{Line, Span, Text},
@@ -163,6 +163,16 @@ struct App {
     scroll: u16,
     shell: Shell,
     status: StatusMonitor,
+    /// Tmux-style zoom: when true the shell fills the body and the nav/viewer
+    /// collapse. A throwaway lever (HANDOFF direction A) that Phase 3's tree-zoom
+    /// subsumes and deletes.
+    zoomed: bool,
+    /// Copy-mode (scrollback view): true while the shell is scrolled back from the
+    /// live bottom. Scroll-only for now; text selection/yank lands with Phase 6.
+    copy_mode: bool,
+    /// The shell pane's content height from the last frame, used as the copy-mode
+    /// page size. Cached in `draw` because `on_key` has no `Frame`.
+    shell_rows: u16,
 }
 
 impl App {
@@ -186,6 +196,9 @@ impl App {
             scroll: 0,
             shell,
             status,
+            zoomed: false,
+            copy_mode: false,
+            shell_rows: 24,
         }
     }
 
@@ -214,16 +227,34 @@ impl App {
         // shell, so you can never get trapped. Cost: the embedded shell never
         // receives Tab, so shell tab-completion is unavailable (see README).
         if key.code == KeyCode::Tab {
+            // Leaving the shell drops any copy-mode scrollback back to live.
+            if self.copy_mode {
+                self.shell.scroll_to_bottom();
+                self.copy_mode = false;
+            }
             self.focus = self.focus.next();
             return;
         }
 
-        // When the shell is focused, every other key goes straight to the PTY.
-        if self.focus == Pane::Shell {
-            let bytes = encode_key(key);
-            if !bytes.is_empty() {
-                self.shell.send_input(&bytes);
+        // ctrl+z is a global zoom toggle (like Tab): the shell body fills the
+        // frame. Global so it works from any pane; the cost mirrors Tab — the
+        // embedded shell never receives ctrl+z, so job-control suspend is
+        // unavailable inside it (see README).
+        if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.zoomed = !self.zoomed;
+            // The zoomed body is shell-only, so focus the shell — otherwise keys
+            // would route to the now-hidden nav/viewer and the full-screen shell
+            // would silently ignore typing.
+            if self.zoomed {
+                self.focus = Pane::Shell;
             }
+            return;
+        }
+
+        // When the shell is focused, keys go to the PTY — unless copy-mode is
+        // active, where they drive the scrollback view instead.
+        if self.focus == Pane::Shell {
+            self.shell_key(key);
             return;
         }
 
@@ -255,6 +286,59 @@ impl App {
             _ => {}
         }
     }
+
+    /// Key handling while the shell is focused. Normally every key passes through
+    /// to the PTY. PageUp opens copy-mode (the scrollback view) when there is
+    /// history to show; in copy-mode the arrows and Page keys move the view, Esc
+    /// snaps back to live, and any other key snaps to live AND passes through, so
+    /// you just start typing to resume.
+    fn shell_key(&mut self, key: KeyEvent) {
+        let page = self.shell_rows.max(1) as i64;
+        if self.copy_mode {
+            match key.code {
+                KeyCode::PageUp => self.shell.scroll_by(page),
+                KeyCode::Up => self.shell.scroll_by(1),
+                KeyCode::PageDown => {
+                    self.shell.scroll_by(-page);
+                    self.copy_mode = self.shell.scrollback_offset() > 0;
+                }
+                KeyCode::Down => {
+                    self.shell.scroll_by(-1);
+                    self.copy_mode = self.shell.scrollback_offset() > 0;
+                }
+                KeyCode::Esc => {
+                    self.shell.scroll_to_bottom();
+                    self.copy_mode = false;
+                }
+                _ => {
+                    self.shell.scroll_to_bottom();
+                    self.copy_mode = false;
+                    self.pty_send(key);
+                }
+            }
+            return;
+        }
+        // Not in copy-mode: PageUp tries to open the scrollback view. If the offset
+        // actually moves, there is history (primary buffer) and we enter copy-mode.
+        // If it stays at 0 we are on the alternate screen — vt100 pins scrollback
+        // there — so the key belongs to the app (vim/less paging) and falls through.
+        if key.code == KeyCode::PageUp {
+            self.shell.scroll_by(page);
+            if self.shell.scrollback_offset() > 0 {
+                self.copy_mode = true;
+                return;
+            }
+        }
+        self.pty_send(key);
+    }
+
+    /// Encode a key and write it to the PTY (no-op for keys that don't map).
+    fn pty_send(&mut self, key: KeyEvent) {
+        let bytes = encode_key(key);
+        if !bytes.is_empty() {
+            self.shell.send_input(&bytes);
+        }
+    }
 }
 
 /// Nav-rail width and the air on each side of a hairline separator.
@@ -273,11 +357,25 @@ struct Regions {
     status: Rect,
 }
 
-fn regions(area: Rect) -> Regions {
+fn regions(area: Rect, zoomed: bool) -> Regions {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
+    // Zoom: the shell fills the whole body; nav, viewer, and the separators
+    // collapse to empty rects (which render nothing). A throwaway lever that
+    // Phase 3's tree-zoom subsumes.
+    if zoomed {
+        let empty = Rect::new(outer[0].x, outer[0].y, 0, 0);
+        return Regions {
+            nav: empty,
+            vsep: empty,
+            viewer: empty,
+            hsep: empty,
+            shell: outer[0],
+            status: outer[1],
+        };
+    }
     // Nav | 1-col hairline | content, with PANE_GAP cols of air around the line.
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -342,13 +440,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     // The embedded shell always renders on the terminal bg (tui-term hard-codes
     // Color::Reset), so deferring to it is the only way to stay seamless — set the
     // terminal profile to jet black for the intended look. We paint fg + accents.
-    let r = regions(f.area());
+    let r = regions(f.area(), app.zoomed);
 
-    // Keep the PTY sized to the shell's content area (region minus its label row).
-    // Pending PTY bytes are drained in the event loop (on Msg::Pty), not here, so
-    // draw() is a pure function of current state.
+    // Keep the PTY sized to the shell's content area (region minus its label row),
+    // and cache that height as the copy-mode page size (on_key has no Frame).
+    // Pending PTY bytes are drained in the event loop (on Msg::Pty), not here.
     let shell_content = content_area(r.shell);
     app.shell.resize(shell_content.height, shell_content.width);
+    app.shell_rows = shell_content.height;
 
     // Hairline separators between panes — single lines, no boxes. Vertical line
     // runs the full body height between nav and content; horizontal line splits
@@ -402,9 +501,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         Paragraph::new(app.doc_text.clone()).scroll((app.scroll, 0)),
         viewer_content,
     );
-    // A thin scrollbar, only when the doc overflows the viewport. Track on the
-    // hairline color, thumb dim — quiet, consistent with the borderless ethos.
-    if app.doc_lines > viewer_content.height as usize {
+    // A thin scrollbar, only when the doc overflows a non-empty viewport. Track on
+    // the hairline color, thumb dim — quiet, consistent with the borderless ethos.
+    // The height guard also covers zoom, where the viewer collapses to 0 rows.
+    if viewer_content.height > 0 && app.doc_lines > viewer_content.height as usize {
         let mut sb = ScrollbarState::new(app.doc_lines).position(app.scroll as usize);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -417,8 +517,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    // Embedded shell — real PTY rendered live.
-    draw_label(f, r.shell, "SHELL", app.focus == Pane::Shell);
+    // Embedded shell — real PTY rendered live. In copy-mode the label carries the
+    // scrollback position marker (rows above the live bottom).
+    let shell_title = if app.copy_mode {
+        format!("SHELL  ↑{}", app.shell.scrollback_offset())
+    } else {
+        "SHELL".to_string()
+    };
+    draw_label(f, r.shell, &shell_title, app.focus == Pane::Shell);
     f.render_widget(PseudoTerminal::new(app.shell.screen()), shell_content);
 
     draw_statusline(f, r.status, app);
@@ -524,8 +630,10 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.status.snapshot();
     let dim = Style::default().fg(Theme::DIM);
     let sep = || Span::styled(" │ ", Style::default().fg(Theme::HAIR));
-    let hint = if app.focus == Pane::Shell {
-        "tab: release shell"
+    let hint = if app.copy_mode {
+        "↑↓/pgup scroll   esc: live"
+    } else if app.focus == Pane::Shell {
+        "tab: release   ^z: zoom"
     } else {
         "tab: focus   q: quit"
     };
@@ -649,7 +757,7 @@ fn main() -> Result<()> {
     // `?` is not a panic, so a failure between init() and restore() would skip
     // cleanup and leave the terminal in raw mode. Spawn with a reasonable default;
     // draw() resizes to the real pane next frame.
-    let shell = Shell::spawn(24, 80, tx.clone())?;
+    let shell = Shell::spawn(24, 80, config.shell.scrollback, tx.clone())?;
     let mut app = App::new(shell, tx.clone(), projects, &config.projects_root);
 
     // Clear the host terminal's main screen and scrollback before entering the
@@ -763,7 +871,7 @@ mod tests {
 
     #[test]
     fn regions_layout_120x40() {
-        let r = regions(Rect::new(0, 0, 120, 40));
+        let r = regions(Rect::new(0, 0, 120, 40), false);
         assert_eq!(r.nav.width, NAV_WIDTH, "nav rail width");
         assert_eq!(r.status.height, 1, "statusline is one row");
         assert_eq!(r.vsep.width, 1, "vertical separator is one cell");
@@ -777,6 +885,21 @@ mod tests {
         // separator comes out of the remainder, so the shell trails by up to the
         // separator height plus odd-parity rounding (2 rows at this geometry).
         assert!((r.viewer.height as i32 - r.shell.height as i32).abs() <= 2);
+    }
+
+    #[test]
+    fn regions_zoomed_shell_fills_body() {
+        let area = Rect::new(0, 0, 120, 40);
+        let r = regions(area, true);
+        // Shell takes the full width and the whole body above the statusline.
+        assert_eq!(r.shell.width, area.width, "zoomed shell spans full width");
+        assert_eq!(r.shell.height, area.height - 1, "zoomed shell fills body");
+        assert_eq!(r.status.height, 1, "statusline survives zoom");
+        // Nav, viewer, and the separators collapse so they render nothing.
+        assert_eq!(r.nav.width, 0);
+        assert_eq!(r.viewer.height, 0);
+        assert_eq!(r.vsep.width, 0);
+        assert_eq!(r.hsep.height, 0);
     }
 
     #[test]

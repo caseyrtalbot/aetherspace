@@ -31,8 +31,7 @@ pub struct Config {
     /// Per-task poll cadences. Consumed in Phase 5.
     #[allow(dead_code)] // wired into the poll loop in Phase 5
     pub poll: PollCfg,
-    /// Shell settings. Consumed in Phase 6.
-    #[allow(dead_code)] // wired into Shell::spawn in Phase 6
+    /// Shell settings (scrollback depth, wired into the PTY parser).
     pub shell: ShellCfg,
 }
 
@@ -83,10 +82,9 @@ impl Default for PollCfg {
     }
 }
 
-/// Shell settings. Consumed in Phase 6.
+/// Shell settings: the scrollback depth (rows) the embedded PTY parser retains.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
-#[allow(dead_code)] // scrollback read once the PTY parser is wired in Phase 6
 pub struct ShellCfg {
     pub scrollback: usize,
 }

@@ -47,7 +47,7 @@ impl Shell {
     /// never reach the draw, stalling output and the quit check. The flag is
     /// cleared in `process_pending` before the byte channel is drained, so bytes
     /// arriving mid-drain re-arm a fresh wakeup.
-    pub fn spawn(rows: u16, cols: u16, notify: Sender<Msg>) -> Result<Self> {
+    pub fn spawn(rows: u16, cols: u16, scrollback: usize, notify: Sender<Msg>) -> Result<Self> {
         let (rows, cols) = (rows.max(1), cols.max(1));
         let pair = native_pty_system().openpty(PtySize {
             rows,
@@ -89,7 +89,7 @@ impl Shell {
         });
 
         Ok(Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, scrollback),
             writer,
             master,
             rx,
@@ -135,6 +135,36 @@ impl Shell {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
+
+    /// Move the scrollback view by `delta` rows: positive scrolls up into history,
+    /// negative scrolls back toward the live bottom. The lower bound (0 = live) is
+    /// ours; the upper bound is vt100's, clamped inside `set_scrollback` to the
+    /// rows actually stored. On the alternate screen vt100 pins scrollback at 0
+    /// (screen.rs), so this is a no-op there — the caller uses that to tell a
+    /// scrollable primary buffer from an alt-screen app.
+    pub fn scroll_by(&mut self, delta: i64) {
+        let target = scroll_delta(self.parser.screen().scrollback(), delta);
+        self.parser.screen_mut().set_scrollback(target);
+    }
+
+    /// Snap the view back to the live bottom (scrollback offset 0).
+    pub fn scroll_to_bottom(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Current scrollback offset in rows: 0 at the live bottom, higher further
+    /// back. Drives the copy-mode position marker and the alt-screen detection.
+    pub fn scrollback_offset(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+}
+
+/// New scrollback offset after moving `delta` rows (positive = further into
+/// history). Clamped at 0, the live bottom; the upper bound belongs to vt100 and
+/// is applied by `set_scrollback`. Pure, so the copy-mode scroll math is tested
+/// without a live PTY.
+fn scroll_delta(current: usize, delta: i64) -> usize {
+    (current as i64 + delta).max(0) as usize
 }
 
 /// Translate a crossterm key event into the byte sequence a PTY expects.
@@ -215,5 +245,18 @@ mod tests {
     #[test]
     fn unmapped_key_is_empty() {
         assert!(encode_key(key(KeyCode::F(5))).is_empty());
+    }
+
+    #[test]
+    fn scroll_delta_moves_into_history() {
+        assert_eq!(scroll_delta(0, 10), 10);
+        assert_eq!(scroll_delta(5, 3), 8);
+    }
+
+    #[test]
+    fn scroll_delta_clamps_at_live_bottom() {
+        // Scrolling down past the live bottom never goes negative.
+        assert_eq!(scroll_delta(3, -10), 0);
+        assert_eq!(scroll_delta(0, -1), 0);
     }
 }

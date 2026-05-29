@@ -35,6 +35,9 @@ tab-completion is unavailable. A future capture mode will restore it.
 | portable-pty | 0.9 | PTY creation and shell spawning |
 | vt100 | 0.16 | Terminal state machine (via tui-term's re-export) |
 | tui-markdown | 0.3 | Markdown rendering with syntect code highlighting |
+| sysinfo | 0.39 | CPU and memory stats for the statusline |
+| gix | 0.84 | Pure-Rust git: branch name and dirty state |
+| ureq | 3.3 | Blocking HTTP for the Spark health probe (no TLS) |
 
 Versions are coupled: `tui-term 0.3.4` pulls `vt100 0.16.2`, which requires
 `ratatui 0.30` (0.29 hard-pins an older `unicode-width` and will not resolve). The
@@ -51,5 +54,5 @@ cargo run
 - [x] Phase 2a: four-region layout, hairline theme, focus cycling
 - [x] Phase 2b: real embedded shell via PTY, live render, key routing
 - [x] Phase 2c: viewer renders the selected project's markdown, scrollable
-- [ ] Phase 2d: live statusline data (system stats, git state, Spark health probe)
+- [x] Phase 2d: live statusline data (CPU, memory, per-project git state, Spark health probe)
 - [ ] Dynamic project discovery, scrollback, mouse, copy/paste

@@ -6,6 +6,7 @@
 //! Nav rail and viewer remain placeholders for Phase 2c.
 
 mod shell;
+mod status;
 mod theme;
 
 use std::time::Duration;
@@ -21,6 +22,7 @@ use ratatui::{
     Frame,
 };
 use shell::{encode_key, Shell};
+use status::{GitState, Health, StatusMonitor};
 use theme::Theme;
 use tui_term::widget::PseudoTerminal;
 
@@ -75,6 +77,7 @@ struct App {
     doc: String,
     scroll: u16,
     shell: Shell,
+    status: StatusMonitor,
 }
 
 impl App {
@@ -86,6 +89,7 @@ impl App {
             "aetherspace",
         ];
         let doc = load_doc(projects[0]);
+        let status = StatusMonitor::spawn(project_path(projects[0]));
         Self {
             running: true,
             focus: Pane::Nav,
@@ -94,14 +98,17 @@ impl App {
             doc,
             scroll: 0,
             shell,
+            status,
         }
     }
 
-    /// Move the nav selection and load that project's doc into the viewer.
+    /// Move the nav selection, load that project's doc, and repoint the status
+    /// poller so git/health reflect the newly selected project.
     fn select(&mut self, index: usize) {
         self.selected = index;
         self.doc = load_doc(self.projects[index]);
         self.scroll = 0;
+        self.status.set_selected(project_path(self.projects[index]));
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -255,33 +262,58 @@ fn draw(f: &mut Frame, app: &mut App) {
 /// Single quiet row of segments divided by thin vertical rules — not a powerline.
 /// Accent is reserved for selection/focus; the live spark dot reads glow-green.
 fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.status.snapshot();
+    let dim = Style::default().fg(Theme::DIM);
     let sep = Span::styled(" │ ", Style::default().fg(Theme::HAIR));
     let hint = if app.focus == Pane::Shell {
         "tab: release shell"
     } else {
         "tab: focus   q: quit"
     };
-    let line = Line::from(vec![
+
+    let mut spans = vec![
         Span::styled(
             " Aetherspace ",
-            Style::default()
-                .fg(Theme::FG)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
         Span::styled(app.projects[app.selected], Style::default().fg(Theme::FG)),
-        sep.clone(),
-        Span::styled("main", Style::default().fg(Theme::DIM)),
-        sep.clone(),
-        Span::styled("●", Style::default().fg(Theme::GLOW_GREEN)),
-        Span::styled(" spark", Style::default().fg(Theme::DIM)),
-        sep,
-        Span::styled(hint, Style::default().fg(Theme::DIM)),
-    ]);
+    ];
+
+    // Git: dim branch name, amber dot only when the working tree is dirty.
+    if let GitState::Repo { branch, dirty } = &s.git {
+        spans.push(Span::styled(format!("  {branch}"), dim));
+        if *dirty {
+            spans.push(Span::styled(" ●", Style::default().fg(Theme::GLOW_AMBER)));
+        }
+    }
+
+    spans.push(sep.clone());
+    spans.push(Span::styled(format!("cpu {:.0}%", s.cpu), dim));
+    spans.push(sep.clone());
+    spans.push(Span::styled(fmt_mem(s.mem_used, s.mem_total), dim));
+    spans.push(sep.clone());
+
+    // Spark health: green when reachable, dim otherwise (down or not yet probed).
+    let dot = match s.spark {
+        Health::Up => Style::default().fg(Theme::GLOW_GREEN),
+        Health::Down | Health::Unknown => dim,
+    };
+    spans.push(Span::styled("●", dot));
+    spans.push(Span::styled(" spark", dim));
+    spans.push(sep);
+    spans.push(Span::styled(hint, dim));
+
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Theme::BG)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Theme::BG)),
         area,
     );
+}
+
+/// Used/total memory in GiB, compact for the statusline, e.g. "mem 4.2/16G".
+fn fmt_mem(used: u64, total: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    format!("mem {:.1}/{:.0}G", used as f64 / GIB, total as f64 / GIB)
 }
 
 fn main() -> Result<()> {

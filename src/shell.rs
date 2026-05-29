@@ -5,6 +5,8 @@
 //! Screen type always matches the widget's expected version.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, sync_channel};
 use std::thread;
 
@@ -25,6 +27,9 @@ pub struct Shell {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     rx: Receiver<Vec<u8>>,
+    // Edge-trigger for the wakeup: true while a Msg::Pty is outstanding. Lets a
+    // byte flood coalesce to one wakeup instead of one per chunk (see spawn).
+    pty_pending: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
     _child: Box<dyn Child + Send + Sync>, // kept alive so the shell process lives
@@ -33,9 +38,15 @@ pub struct Shell {
 impl Shell {
     /// Open a PTY, spawn the user's default shell, and start draining its output
     /// on a background thread into a bounded channel. `notify` wakes the event loop
-    /// (Msg::Pty) whenever bytes land, so the loop can sleep at idle instead of
-    /// polling. The wakeup is sent after each byte chunk on the unbounded message
-    /// channel, so a full byte channel never deadlocks the loop.
+    /// (Msg::Pty) when bytes land, so the loop can sleep at idle instead of polling.
+    ///
+    /// The wakeup is *edge-triggered*: the reader sets `pty_pending` and sends
+    /// Msg::Pty only on the false→true transition, so a saturating stream (`yes`,
+    /// `cat bigfile`) produces one outstanding wakeup, not one per chunk. Without
+    /// this, the loop's coalesce-drain could be re-fed faster than it drains and
+    /// never reach the draw, stalling output and the quit check. The flag is
+    /// cleared in `process_pending` before the byte channel is drained, so bytes
+    /// arriving mid-drain re-arm a fresh wakeup.
     pub fn spawn(rows: u16, cols: u16, notify: Sender<Msg>) -> Result<Self> {
         let (rows, cols) = (rows.max(1), cols.max(1));
         let pair = native_pty_system().openpty(PtySize {
@@ -56,6 +67,8 @@ impl Shell {
         let master = pair.master;
 
         let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_DEPTH);
+        let pty_pending = Arc::new(AtomicBool::new(false));
+        let pending = Arc::clone(&pty_pending);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -65,9 +78,11 @@ impl Shell {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // receiver gone (app shutting down)
                         }
-                        // Wake the loop so it drains and redraws. Ignore send
-                        // errors: a gone receiver just means we're shutting down.
-                        let _ = notify.send(Msg::Pty);
+                        // Edge-triggered wakeup: notify only when none is pending.
+                        // Ignore send errors (gone receiver = shutting down).
+                        if !pending.swap(true, Ordering::AcqRel) {
+                            let _ = notify.send(Msg::Pty);
+                        }
                     }
                 }
             }
@@ -78,6 +93,7 @@ impl Shell {
             writer,
             master,
             rx,
+            pty_pending,
             rows,
             cols,
             _child: child,
@@ -85,7 +101,10 @@ impl Shell {
     }
 
     /// Feed any bytes the shell has emitted since the last frame into the parser.
+    /// Clears the wakeup flag *before* draining, so a chunk that arrives mid-drain
+    /// re-arms a fresh Msg::Pty and is never lost.
     pub fn process_pending(&mut self) {
+        self.pty_pending.store(false, Ordering::Release);
         while let Ok(chunk) = self.rx.try_recv() {
             self.parser.process(&chunk);
         }

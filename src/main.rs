@@ -570,18 +570,21 @@ where
         // Sleep until a message arrives.
         let Ok(msg) = rx.recv() else { break };
         let mut dirty = handle(app, msg);
-        // Drain anything else already queued so a burst becomes a single redraw.
+        // Drain what's already queued so a burst becomes one redraw. PTY wakeups
+        // are edge-triggered (see Shell), so this can't be starved by a flood;
+        // bail on quit so q/Esc takes effect immediately.
         while let Ok(msg) = rx.try_recv() {
             dirty |= handle(app, msg);
+            if !app.running {
+                break;
+            }
         }
         if dirty && app.running {
-            // Throttle to at most one draw per frame; coalesce what lands meanwhile.
+            // Throttle to at most one draw per frame. Bytes that arrive during the
+            // sleep are parsed and shown on the next iteration (one frame later).
             let since = last_draw.elapsed();
             if since < FRAME {
                 thread::sleep(FRAME - since);
-                while let Ok(msg) = rx.try_recv() {
-                    handle(app, msg);
-                }
             }
             terminal.draw(|f| draw(f, app))?;
             last_draw = Instant::now();

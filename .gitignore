@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# working docs (local R&D, planning, scratch — not committed)
+docs/working/

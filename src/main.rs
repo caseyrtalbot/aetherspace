@@ -8,6 +8,7 @@
 
 mod clipboard;
 mod config;
+mod layout;
 mod log;
 mod shell;
 mod status;

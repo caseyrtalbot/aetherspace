@@ -12,6 +12,7 @@ mod log;
 mod shell;
 mod status;
 mod theme;
+mod workspace;
 mod xdg;
 
 use std::borrow::Cow;
@@ -32,11 +33,11 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
-use shell::{Shell, encode_key};
+use shell::Shell;
 use status::{GitState, Health, Snapshot, StatusMonitor, TreeState};
 use theme::{MarkdownTheme, Theme};
-use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use workspace::Workspace;
 
 /// The render-rate cap: under heavy PTY output we coalesce bursts and draw at
 /// most once per frame (~60fps). At idle the loop blocks on the channel and never
@@ -161,18 +162,12 @@ struct App {
     doc_text: Text<'static>, // parsed once on select(), not per frame
     doc_lines: usize,        // cached line count for scroll clamping
     scroll: u16,
-    shell: Shell,
+    workspace: Workspace,
     status: StatusMonitor,
     /// Tmux-style zoom: when true the shell fills the body and the nav/viewer
     /// collapse. A throwaway lever (HANDOFF direction A) that Phase 3's tree-zoom
     /// subsumes and deletes.
     zoomed: bool,
-    /// Copy-mode (scrollback view): true while the shell is scrolled back from the
-    /// live bottom. Scroll-only for now; text selection/yank lands with Phase 6.
-    copy_mode: bool,
-    /// The shell pane's content height from the last frame, used as the copy-mode
-    /// page size. Cached in `draw` because `on_key` has no `Frame`.
-    shell_rows: u16,
 }
 
 impl App {
@@ -194,11 +189,9 @@ impl App {
             doc_text,
             doc_lines,
             scroll: 0,
-            shell,
+            workspace: Workspace::new(shell),
             status,
             zoomed: false,
-            copy_mode: false,
-            shell_rows: 24,
         }
     }
 
@@ -228,10 +221,7 @@ impl App {
         // receives Tab, so shell tab-completion is unavailable (see README).
         if key.code == KeyCode::Tab {
             // Leaving the shell drops any copy-mode scrollback back to live.
-            if self.copy_mode {
-                self.shell.scroll_to_bottom();
-                self.copy_mode = false;
-            }
+            self.workspace.exit_copy_mode();
             self.focus = self.focus.next();
             return;
         }
@@ -254,7 +244,7 @@ impl App {
         // When the shell is focused, keys go to the PTY — unless copy-mode is
         // active, where they drive the scrollback view instead.
         if self.focus == Pane::Shell {
-            self.shell_key(key);
+            self.workspace.on_key(key);
             return;
         }
 
@@ -284,59 +274,6 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(10);
             }
             _ => {}
-        }
-    }
-
-    /// Key handling while the shell is focused. Normally every key passes through
-    /// to the PTY. PageUp opens copy-mode (the scrollback view) when there is
-    /// history to show; in copy-mode the arrows and Page keys move the view, Esc
-    /// snaps back to live, and any other key snaps to live AND passes through, so
-    /// you just start typing to resume.
-    fn shell_key(&mut self, key: KeyEvent) {
-        let page = self.shell_rows.max(1) as i64;
-        if self.copy_mode {
-            match key.code {
-                KeyCode::PageUp => self.shell.scroll_by(page),
-                KeyCode::Up => self.shell.scroll_by(1),
-                KeyCode::PageDown => {
-                    self.shell.scroll_by(-page);
-                    self.copy_mode = self.shell.scrollback_offset() > 0;
-                }
-                KeyCode::Down => {
-                    self.shell.scroll_by(-1);
-                    self.copy_mode = self.shell.scrollback_offset() > 0;
-                }
-                KeyCode::Esc => {
-                    self.shell.scroll_to_bottom();
-                    self.copy_mode = false;
-                }
-                _ => {
-                    self.shell.scroll_to_bottom();
-                    self.copy_mode = false;
-                    self.pty_send(key);
-                }
-            }
-            return;
-        }
-        // Not in copy-mode: PageUp tries to open the scrollback view. If the offset
-        // actually moves, there is history (primary buffer) and we enter copy-mode.
-        // If it stays at 0 we are on the alternate screen — vt100 pins scrollback
-        // there — so the key belongs to the app (vim/less paging) and falls through.
-        if key.code == KeyCode::PageUp {
-            self.shell.scroll_by(page);
-            if self.shell.scrollback_offset() > 0 {
-                self.copy_mode = true;
-                return;
-            }
-        }
-        self.pty_send(key);
-    }
-
-    /// Encode a key and write it to the PTY (no-op for keys that don't map).
-    fn pty_send(&mut self, key: KeyEvent) {
-        let bytes = encode_key(key);
-        if !bytes.is_empty() {
-            self.shell.send_input(&bytes);
         }
     }
 }
@@ -408,7 +345,7 @@ fn regions(area: Rect, zoomed: bool) -> Regions {
 
 /// The content sub-area of a borderless pane: the region minus its top label row.
 /// Shared by rendering and PTY-resize so the shell is always sized to what's drawn.
-fn content_area(area: Rect) -> Rect {
+pub(crate) fn content_area(area: Rect) -> Rect {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -418,7 +355,7 @@ fn content_area(area: Rect) -> Rect {
 /// Render a borderless pane's label on its top row — accent when focused, dim
 /// otherwise — and return the content area below it. The label is the only focus
 /// cue; there is no box.
-fn draw_label(f: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
+pub(crate) fn draw_label(f: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -441,13 +378,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Color::Reset), so deferring to it is the only way to stay seamless — set the
     // terminal profile to jet black for the intended look. We paint fg + accents.
     let r = regions(f.area(), app.zoomed);
-
-    // Keep the PTY sized to the shell's content area (region minus its label row),
-    // and cache that height as the copy-mode page size (on_key has no Frame).
-    // Pending PTY bytes are drained in the event loop (on Msg::Pty), not here.
-    let shell_content = content_area(r.shell);
-    app.shell.resize(shell_content.height, shell_content.width);
-    app.shell_rows = shell_content.height;
 
     // Hairline separators between panes — single lines, no boxes. Vertical line
     // runs the full body height between nav and content; horizontal line splits
@@ -517,15 +447,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    // Embedded shell — real PTY rendered live. In copy-mode the label carries the
-    // scrollback position marker (rows above the live bottom).
-    let shell_title = if app.copy_mode {
-        format!("SHELL  ↑{}", app.shell.scrollback_offset())
-    } else {
-        "SHELL".to_string()
-    };
-    draw_label(f, r.shell, &shell_title, app.focus == Pane::Shell);
-    f.render_widget(PseudoTerminal::new(app.shell.screen()), shell_content);
+    // Embedded shell — real PTY rendered live. The workspace owns the resize+draw
+    // loop internally (label with copy-mode marker, then the live screen), so this
+    // mutable pane borrow never aliases the chrome reads above.
+    app.workspace.render(f, r.shell, app.focus == Pane::Shell);
 
     draw_statusline(f, r.status, app);
 }
@@ -630,7 +555,7 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.status.snapshot();
     let dim = Style::default().fg(Theme::DIM);
     let sep = || Span::styled(" │ ", Style::default().fg(Theme::HAIR));
-    let hint = if app.copy_mode {
+    let hint = if app.workspace.copy_mode() {
         "↑↓/pgup scroll   esc: live"
     } else if app.focus == Pane::Shell {
         "tab: release   ^z: zoom"
@@ -810,7 +735,7 @@ fn handle(app: &mut App, msg: Msg) -> bool {
         Msg::Input(Event::Resize(_, _)) => true,
         Msg::Input(_) => false, // non-press key kinds; mouse/paste land in Phase 8
         Msg::Pty => {
-            app.shell.process_pending();
+            app.workspace.process_pending();
             true
         }
         Msg::Status => true,

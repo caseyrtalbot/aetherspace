@@ -13,7 +13,9 @@ mod status;
 mod theme;
 
 use std::borrow::Cow;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -34,9 +36,22 @@ use status::{GitState, Health, Snapshot, StatusMonitor, TreeState};
 use theme::{MarkdownTheme, Theme};
 use tui_term::widget::PseudoTerminal;
 
-/// Tick between frames; also the input poll timeout, so shell output renders
-/// live even when no key is pressed.
-const TICK: Duration = Duration::from_millis(16);
+/// The render-rate cap: under heavy PTY output we coalesce bursts and draw at
+/// most once per frame (~60fps). At idle the loop blocks on the channel and never
+/// wakes, so this is a ceiling, not a clock.
+const FRAME: Duration = Duration::from_millis(16);
+
+/// A single multi-source event channel feeds the render loop. A dedicated input
+/// thread blocks on `event::read()` and forwards `Input`; the PTY reader thread
+/// sends `Pty` when bytes land; the status poller sends `Status` after it
+/// publishes. The main loop blocks on the receiver (true sleep at idle), drains
+/// queued messages to coalesce a burst, and draws once. No async runtime, in
+/// keeping with the std/mpsc stance already in shell.rs and status.rs.
+pub enum Msg {
+    Input(Event),
+    Pty,
+    Status,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -137,7 +152,7 @@ struct App {
 }
 
 impl App {
-    fn new(shell: Shell) -> Self {
+    fn new(shell: Shell, tx: Sender<Msg>) -> Self {
         let projects = vec![
             "thought-engine",
             "antigrav-explore",
@@ -145,7 +160,7 @@ impl App {
             "aetherspace",
         ];
         let (doc_text, doc_lines) = render_doc(projects[0]);
-        let status = StatusMonitor::spawn(project_path(projects[0]));
+        let status = StatusMonitor::spawn(project_path(projects[0]), tx);
         Self {
             running: true,
             focus: Pane::Nav,
@@ -306,9 +321,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     let r = regions(f.area());
 
     // Keep the PTY sized to the shell's content area (region minus its label row).
+    // Pending PTY bytes are drained in the event loop (on Msg::Pty), not here, so
+    // draw() is a pure function of current state.
     let shell_content = content_area(r.shell);
     app.shell.resize(shell_content.height, shell_content.width);
-    app.shell.process_pending();
 
     // Hairline separators between panes — single lines, no boxes. Vertical line
     // runs the full body height between nav and content; horizontal line splits
@@ -480,17 +496,21 @@ fn main() -> Result<()> {
     log::init();
     log::info("aetherspace starting");
 
+    // All sources funnel into one channel; create it before the producers.
+    let (tx, rx) = mpsc::channel::<Msg>();
+
     // Do all fallible setup BEFORE entering the alternate screen. ratatui::init()
     // installs a panic hook that restores the terminal on panic, but an Err from
     // `?` is not a panic, so a failure between init() and restore() would skip
     // cleanup and leave the terminal in raw mode. Spawn with a reasonable default;
     // draw() resizes to the real pane next frame.
-    let shell = Shell::spawn(24, 80)?;
-    let mut app = App::new(shell);
+    let shell = Shell::spawn(24, 80, tx.clone())?;
+    let mut app = App::new(shell, tx.clone());
 
     let mut terminal = ratatui::init();
     install_panic_hook();
-    let result = run(&mut terminal, &mut app);
+    spawn_input_thread(tx);
+    let result = run(&mut terminal, &mut app, rx);
     ratatui::restore();
     if let Err(e) = &result {
         log::error(&format!("exited with error: {e}"));
@@ -498,20 +518,73 @@ fn main() -> Result<()> {
     result
 }
 
+/// A dedicated thread that blocks on `event::read()` and forwards every terminal
+/// event into the channel. crossterm's event API is synchronous and cannot wait
+/// on our PTY/status channels at once, so reading on its own thread is what lets
+/// the main loop sleep on a single receiver instead of polling at 60fps.
+fn spawn_input_thread(tx: Sender<Msg>) {
+    thread::spawn(move || {
+        // Exits when event::read() errors or the main loop drops the receiver.
+        while let Ok(ev) = event::read() {
+            if tx.send(Msg::Input(ev)).is_err() {
+                break; // main loop gone
+            }
+        }
+    });
+}
+
+/// Apply one message to the app, returning whether it warrants a redraw.
+/// Invariant: a `Msg::Pty` must always drain the PTY and request a redraw, or
+/// live shell output would stall (covered by the `cat bigfile` smoke test).
+fn handle(app: &mut App, msg: Msg) -> bool {
+    match msg {
+        Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+            app.on_key(key);
+            true
+        }
+        Msg::Input(Event::Resize(_, _)) => true,
+        Msg::Input(_) => false, // non-press key kinds; mouse/paste land in Phase 8
+        Msg::Pty => {
+            app.shell.process_pending();
+            true
+        }
+        Msg::Status => true,
+    }
+}
+
 /// Generic over the ratatui `Backend`: the renderer seam. `DefaultTerminal`'s
 /// backend errors are `io::Error` (satisfying the bound), so `main()` is unchanged;
 /// the payoff is the future native frontend and `TestBackend`-driven render tests.
-fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+///
+/// The loop blocks on `rx.recv()` (a true sleep, ~0% CPU at idle), wakes on any
+/// message, coalesces everything already queued into one redraw, and caps the
+/// draw rate at `FRAME` under heavy output.
+fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, rx: Receiver<Msg>) -> Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    terminal.draw(|f| draw(f, app))?; // initial paint
+    let mut last_draw = Instant::now();
+
     while app.running {
-        terminal.draw(|f| draw(f, app))?;
-        if event::poll(TICK)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.on_key(key);
+        // Sleep until a message arrives.
+        let Ok(msg) = rx.recv() else { break };
+        let mut dirty = handle(app, msg);
+        // Drain anything else already queued so a burst becomes a single redraw.
+        while let Ok(msg) = rx.try_recv() {
+            dirty |= handle(app, msg);
+        }
+        if dirty && app.running {
+            // Throttle to at most one draw per frame; coalesce what lands meanwhile.
+            let since = last_draw.elapsed();
+            if since < FRAME {
+                thread::sleep(FRAME - since);
+                while let Ok(msg) = rx.try_recv() {
+                    handle(app, msg);
+                }
+            }
+            terminal.draw(|f| draw(f, app))?;
+            last_draw = Instant::now();
         }
     }
     Ok(())

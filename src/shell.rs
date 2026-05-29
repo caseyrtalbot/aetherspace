@@ -5,13 +5,20 @@
 //! Screen type always matches the widget's expected version.
 
 use std::io::{Read, Write};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, sync_channel};
 use std::thread;
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_term::vt100;
+
+use crate::Msg;
+
+/// Bound on the PTY byte channel: backpressure so a flood (`cat bigfile`, `yes`)
+/// can't grow memory unbounded. The reader blocks once 64 chunks are unread; the
+/// event loop drains them each wake. 64 * 8 KiB ≈ 512 KiB worst case in flight.
+const PTY_CHANNEL_DEPTH: usize = 64;
 
 pub struct Shell {
     parser: vt100::Parser,
@@ -24,9 +31,12 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// Open a PTY, spawn the user's default shell, and start draining its
-    /// output on a background thread into a channel.
-    pub fn spawn(rows: u16, cols: u16) -> Result<Self> {
+    /// Open a PTY, spawn the user's default shell, and start draining its output
+    /// on a background thread into a bounded channel. `notify` wakes the event loop
+    /// (Msg::Pty) whenever bytes land, so the loop can sleep at idle instead of
+    /// polling. The wakeup is sent after each byte chunk on the unbounded message
+    /// channel, so a full byte channel never deadlocks the loop.
+    pub fn spawn(rows: u16, cols: u16, notify: Sender<Msg>) -> Result<Self> {
         let (rows, cols) = (rows.max(1), cols.max(1));
         let pair = native_pty_system().openpty(PtySize {
             rows,
@@ -45,7 +55,7 @@ impl Shell {
         let writer = pair.master.take_writer()?;
         let master = pair.master;
 
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_DEPTH);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -55,6 +65,9 @@ impl Shell {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // receiver gone (app shutting down)
                         }
+                        // Wake the loop so it drains and redraws. Ignore send
+                        // errors: a gone receiver just means we're shutting down.
+                        let _ = notify.send(Msg::Pty);
                     }
                 }
             }

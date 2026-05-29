@@ -1,16 +1,20 @@
 //! Live system status for the statusline: CPU, memory, the selected project's
 //! git state, and Spark inference-endpoint health. One background poller thread
-//! refreshes everything on a timer and publishes the latest snapshot; the 16ms
-//! render loop only ever reads it, so a slow or dead network probe can never
-//! stall a frame. Transport is std + pure-Rust throughout (sysinfo, gix, ureq).
+//! refreshes everything on a timer, publishes the latest snapshot, and wakes the
+//! render loop (Msg::Status); the loop only ever reads the snapshot, so a slow or
+//! dead network probe can never stall a frame. Transport is std + pure-Rust
+//! throughout (sysinfo, gix, ureq).
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use sysinfo::System;
 use ureq::Agent;
+
+use crate::Msg;
 
 /// How often the poller refreshes. The network probe dominates; 2s keeps the
 /// health dot responsive without hammering the endpoint.
@@ -74,12 +78,13 @@ pub struct StatusMonitor {
 
 impl StatusMonitor {
     /// Spawn the poller, pointed at `initial`. The thread is detached and dies
-    /// with the process; a TUI needs no graceful join.
-    pub fn spawn(initial: PathBuf) -> Self {
+    /// with the process; a TUI needs no graceful join. `notify` wakes the render
+    /// loop after each publish so the statusline refreshes without polling.
+    pub fn spawn(initial: PathBuf, notify: Sender<Msg>) -> Self {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let selected = Arc::new(Mutex::new(initial));
         let (snap, sel) = (Arc::clone(&snapshot), Arc::clone(&selected));
-        thread::spawn(move || poll_loop(snap, sel));
+        thread::spawn(move || poll_loop(snap, sel, notify));
         Self { snapshot, selected }
     }
 
@@ -96,7 +101,7 @@ impl StatusMonitor {
     }
 }
 
-fn poll_loop(snapshot: Arc<Mutex<Snapshot>>, selected: Arc<Mutex<PathBuf>>) {
+fn poll_loop(snapshot: Arc<Mutex<Snapshot>>, selected: Arc<Mutex<PathBuf>>, notify: Sender<Msg>) {
     let mut sys = System::new();
     let agent: Agent = Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(2)))
@@ -129,6 +134,9 @@ fn poll_loop(snapshot: Arc<Mutex<Snapshot>>, selected: Arc<Mutex<PathBuf>>) {
         if let Ok(mut slot) = snapshot.lock() {
             *slot = next;
         }
+        // Wake the render loop to repaint the statusline. A gone receiver means
+        // the app is shutting down, so the error is safely ignored.
+        let _ = notify.send(Msg::Status);
         thread::sleep(POLL_INTERVAL);
     }
 }

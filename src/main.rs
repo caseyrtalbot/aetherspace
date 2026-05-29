@@ -652,6 +652,18 @@ fn main() -> Result<()> {
     let shell = Shell::spawn(24, 80, tx.clone())?;
     let mut app = App::new(shell, tx.clone(), projects, &config.projects_root);
 
+    // Clear the host terminal's main screen and scrollback before entering the
+    // alternate screen. Terminal.app lets you scroll out of the alt screen into
+    // the main buffer; without this, scrolling up at runtime reveals the
+    // pre-launch `cargo run` output and a screenful of blank rows. CSI 2J clears
+    // the screen, CSI 3J erases the scrollback, CSI H homes the cursor.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[2J\x1b[3J\x1b[H");
+        let _ = out.flush();
+    }
+
     let mut terminal = ratatui::init();
     install_panic_hook();
     spawn_input_thread(tx);

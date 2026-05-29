@@ -317,11 +317,15 @@ fn fmt_mem(used: u64, total: u64) -> String {
 }
 
 fn main() -> Result<()> {
-    let mut terminal = ratatui::init();
-    // Spawn with a reasonable default; draw() resizes to the real pane next frame.
+    // Do all fallible setup BEFORE entering the alternate screen. ratatui::init()
+    // installs a panic hook that restores the terminal on panic, but an Err from
+    // `?` is not a panic, so a failure between init() and restore() would skip
+    // cleanup and leave the terminal in raw mode. Spawn with a reasonable default;
+    // draw() resizes to the real pane next frame.
     let shell = Shell::spawn(24, 80)?;
     let mut app = App::new(shell);
 
+    let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
     result

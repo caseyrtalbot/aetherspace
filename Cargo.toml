@@ -11,10 +11,10 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.102"
-gix = { version = "0.84.0", default-features = false, features = ["status", "revision", "sha1"] }
+gix = { version = "0.84.0", default-features = false, features = ["status", "sha1"] }
 portable-pty = "0.9.0"
 ratatui = "0.30"
-sysinfo = "0.39.3"
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
 tui-markdown = "0.3.7"
 tui-term = "0.3.4"
 ureq = { version = "3.3.0", default-features = false }

@@ -22,7 +22,7 @@ impl Theme {
     pub const HAIR: Color = Color::Rgb(0x2a, 0x26, 0x22); // warm-tinted 1px hairline
 
     // --- The one accent: retro orange ---
-    pub const ACCENT: Color = Color::Rgb(0xff, 0x7a, 0x1a); // selection, focus, primary signal
+    pub const ACCENT: Color = Color::Rgb(0xff, 0x7a, 0x1a); // the one accent: selection + focus only
     pub const SELECT_BG: Color = Color::Rgb(0x2a, 0x17, 0x0a); // faint orange-glow row fill
 
     // --- Glowy-retro secondaries (everything that isn't the accent) ---

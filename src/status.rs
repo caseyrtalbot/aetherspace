@@ -96,8 +96,12 @@ fn poll_loop(snapshot: Arc<Mutex<Snapshot>>, selected: Arc<Mutex<PathBuf>>) {
         .build()
         .into();
 
-    // Prime CPU so the first published reading is a real delta, not a cold zero.
+    // Prime CPU, then let the platform's minimum sampling interval elapse before
+    // the first real refresh. sysinfo computes usage as a delta between refreshes
+    // and skips the recompute if less than MINIMUM_CPU_UPDATE_INTERVAL has passed,
+    // so without this sleep the first published reading would be a cold 0%.
     sys.refresh_cpu_usage();
+    thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
 
     loop {
         sys.refresh_cpu_usage();
@@ -122,6 +126,11 @@ fn poll_loop(snapshot: Arc<Mutex<Snapshot>>, selected: Arc<Mutex<PathBuf>>) {
 /// Branch name + dirty flag for a project directory. gix's `is_dirty` counts
 /// index and working-tree changes to tracked files; untracked-only changes do
 /// not flip it, which is the right granularity for an at-a-glance dot.
+///
+/// Note (v0.1): `is_dirty` walks the full worktree on every poll. It runs on
+/// this background thread so it never stalls a frame, but on a very large tree
+/// it churns a core. Acceptable for now; a later pass can cache by path/mtime or
+/// poll git on a slower cadence than the health probe.
 fn read_git(path: &Path) -> GitState {
     let Ok(repo) = gix::open(path) else {
         return GitState::None;

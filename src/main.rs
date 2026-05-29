@@ -15,10 +15,10 @@ use std::{env, fs, path::PathBuf};
 use anyhow::Result;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Spacing},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use shell::{encode_key, Shell};
@@ -159,11 +159,18 @@ impl App {
     }
 }
 
-/// The four-region command-center layout: nav rail + (viewer over shell) + a
-/// one-row statusline. Returned so both rendering and PTY-resize use one source.
+/// Nav-rail width and the air on each side of a hairline separator.
+const NAV_WIDTH: u16 = 24;
+const PANE_GAP: u16 = 2;
+
+/// The command-center layout: nav rail | hairline | (viewer / hairline / shell),
+/// over a one-row statusline. `vsep`/`hsep` are 1-cell separator tracks. Returned
+/// so rendering and PTY-resize share one source of truth.
 struct Regions {
     nav: Rect,
+    vsep: Rect,
     viewer: Rect,
+    hsep: Rect,
     shell: Rect,
     status: Rect,
 }
@@ -173,50 +180,92 @@ fn regions(area: Rect) -> Regions {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
+    // Nav | 1-col hairline | content, with PANE_GAP cols of air around the line.
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(NAV_WIDTH),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .spacing(Spacing::Space(PANE_GAP))
         .split(outer[0]);
+    // Viewer / 1-row hairline / shell, split at the halfway line so the shell
+    // fills the bottom half of the terminal.
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(body[1]);
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(body[2]);
     Regions {
         nav: body[0],
+        vsep: body[1],
         viewer: right[0],
-        shell: right[1],
+        hsep: right[1],
+        shell: right[2],
         status: outer[1],
     }
 }
 
-/// A bordered region in the hairline aesthetic: 1px border (accent when focused,
-/// hairline when idle) with a tiny uppercase label riding on the top edge.
-fn block(title: &str, focused: bool) -> Block<'_> {
-    let border = if focused {
-        Theme::border_focused()
+/// The content sub-area of a borderless pane: the region minus its top label row.
+/// Shared by rendering and PTY-resize so the shell is always sized to what's drawn.
+fn content_area(area: Rect) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area)[1]
+}
+
+/// Render a borderless pane's label on its top row — accent when focused, dim
+/// otherwise — and return the content area below it. The label is the only focus
+/// cue; there is no box.
+fn draw_label(f: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let style = if focused {
+        Theme::label_focused()
     } else {
-        Theme::border_idle()
+        Theme::label()
     };
-    Block::bordered()
-        .border_style(border)
-        .title(Span::styled(format!(" {title} "), Theme::label()))
-        .style(Style::default().bg(Theme::BG).fg(Theme::FG))
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!(" {title}"), style))),
+        rows[0],
+    );
+    rows[1]
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    f.render_widget(
-        Block::default().style(Style::default().bg(Theme::BG)),
-        area,
-    );
-    let r = regions(area);
+    // No background fill: the app inherits the terminal's background everywhere.
+    // The embedded shell always renders on the terminal bg (tui-term hard-codes
+    // Color::Reset), so deferring to it is the only way to stay seamless — set the
+    // terminal profile to jet black for the intended look. We paint fg + accents.
+    let r = regions(f.area());
 
-    // Keep the PTY sized to the shell pane's inner area, then absorb new output.
-    let inner = block("", false).inner(r.shell);
-    app.shell.resize(inner.height, inner.width);
+    // Keep the PTY sized to the shell's content area (region minus its label row).
+    let shell_content = content_area(r.shell);
+    app.shell.resize(shell_content.height, shell_content.width);
     app.shell.process_pending();
 
+    // Hairline separators between panes — single lines, no boxes. Vertical line
+    // runs the full body height between nav and content; horizontal line splits
+    // viewer from shell.
+    let hair = Style::default().fg(Theme::HAIR);
+    let vline: Vec<Line> = (0..r.vsep.height)
+        .map(|_| Line::from(Span::styled("│", hair)))
+        .collect();
+    f.render_widget(Paragraph::new(vline), r.vsep);
+    f.render_widget(
+        Paragraph::new("─".repeat(r.hsep.width as usize)).style(hair),
+        r.hsep,
+    );
+
     // Nav rail — project list, selected row in the one accent color.
+    let nav_content = draw_label(f, r.nav, "PROJECTS", app.focus == Pane::Nav);
     let nav_lines: Vec<Line> = app
         .projects
         .iter()
@@ -235,26 +284,20 @@ fn draw(f: &mut Frame, app: &mut App) {
             }
         })
         .collect();
-    f.render_widget(
-        Paragraph::new(nav_lines).block(block("PROJECTS", app.focus == Pane::Nav)),
-        r.nav,
-    );
+    f.render_widget(Paragraph::new(nav_lines), nav_content);
 
-    // Content viewer — selected project's doc, rendered as markdown (with
-    // syntect code-block highlighting) and scrollable when focused.
+    // Content viewer — selected project's doc as markdown (syntect-highlighted),
+    // scrollable when focused.
+    let viewer_content = draw_label(f, r.viewer, "VIEWER", app.focus == Pane::Viewer);
     let doc = tui_markdown::from_str(&app.doc);
     f.render_widget(
-        Paragraph::new(doc)
-            .block(block("VIEWER", app.focus == Pane::Viewer))
-            .scroll((app.scroll, 0)),
-        r.viewer,
+        Paragraph::new(doc).scroll((app.scroll, 0)),
+        viewer_content,
     );
 
     // Embedded shell — real PTY rendered live.
-    let shell_block = block("SHELL", app.focus == Pane::Shell);
-    let shell_inner = shell_block.inner(r.shell);
-    f.render_widget(shell_block, r.shell);
-    f.render_widget(PseudoTerminal::new(app.shell.screen()), shell_inner);
+    draw_label(f, r.shell, "SHELL", app.focus == Pane::Shell);
+    f.render_widget(PseudoTerminal::new(app.shell.screen()), shell_content);
 
     draw_statusline(f, r.status, app);
 }
@@ -264,7 +307,6 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.status.snapshot();
     let dim = Style::default().fg(Theme::DIM);
-    let bg = Style::default().bg(Theme::BG);
     let sep = Span::styled(" │ ", Style::default().fg(Theme::HAIR));
     let hint = if app.focus == Pane::Shell {
         "tab: release shell"
@@ -318,11 +360,9 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::styled("●", spark));
     spans.push(Span::styled(" spark", dim));
 
-    f.render_widget(Paragraph::new(Line::from(spans)).style(bg), cols[0]);
+    f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, dim)))
-            .alignment(Alignment::Right)
-            .style(bg),
+        Paragraph::new(Line::from(Span::styled(hint, dim))).alignment(Alignment::Right),
         cols[1],
     );
 }

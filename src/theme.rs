@@ -5,7 +5,10 @@
 //!
 //! Note: a terminal cell grid can't do real glow/bloom — "glowy" here means
 //! saturated brights on true black, not a blur effect. Font is the host
-//! terminal's, not ours to set.
+//! terminal's, not ours to set — and neither is the background. The app paints
+//! only foreground + accents and lets the terminal own the background, so the
+//! embedded shell (which always renders on the terminal bg) stays seamless. Set
+//! the terminal profile to `BG` below for the intended jet-black look.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -16,7 +19,7 @@ pub struct Theme;
 #[allow(dead_code)]
 impl Theme {
     // --- Core: jet black + white ---
-    pub const BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a); // jet-black paper
+    pub const BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a); // recommended terminal bg (not painted)
     pub const FG: Color = Color::Rgb(0xed, 0xed, 0xed); // white ink
     pub const DIM: Color = Color::Rgb(0x6b, 0x6b, 0x6b); // labels, inactive
     pub const HAIR: Color = Color::Rgb(0x2a, 0x26, 0x22); // warm-tinted 1px hairline
@@ -31,20 +34,18 @@ impl Theme {
     pub const GLOW_AMBER: Color = Color::Rgb(0xff, 0xb0, 0x2e); // warning / dirty
     pub const GLOW_MAGENTA: Color = Color::Rgb(0xff, 0x5f, 0xa0); // special / accent-2
 
-    /// Border style for the pane that currently has focus.
-    pub fn border_focused() -> Style {
-        Style::default().fg(Self::ACCENT)
-    }
-
-    /// Border style for unfocused panes — barely-there hairline.
-    pub fn border_idle() -> Style {
-        Style::default().fg(Self::HAIR)
-    }
-
-    /// Tiny uppercase region label riding on the hairline.
+    /// Tiny uppercase region label for an unfocused pane — barely-there.
     pub fn label() -> Style {
         Style::default()
             .fg(Self::DIM)
             .add_modifier(Modifier::DIM | Modifier::BOLD)
+    }
+
+    /// Region label for the focused pane. Borderless: the label *is* the focus
+    /// indicator, so it carries the one accent color instead of a drawn box.
+    pub fn label_focused() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .add_modifier(Modifier::BOLD)
     }
 }

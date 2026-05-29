@@ -5,24 +5,31 @@
 //! global key that always cycles focus, so you're never trapped in the shell.
 //! Nav rail and viewer remain placeholders for Phase 2c.
 
+mod clipboard;
+mod config;
+mod log;
 mod shell;
 mod status;
 mod theme;
 
 use std::time::Duration;
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use ratatui::{
+    Frame, Terminal,
+    backend::Backend,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     layout::{Alignment, Constraint, Direction, Layout, Rect, Spacing},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
-use shell::{encode_key, Shell};
-use status::{GitState, Health, StatusMonitor, TreeState};
+use shell::{Shell, encode_key};
+use status::{GitState, Health, Snapshot, StatusMonitor, TreeState};
 use theme::{MarkdownTheme, Theme};
 use tui_term::widget::PseudoTerminal;
 
@@ -291,16 +298,28 @@ fn draw(f: &mut Frame, app: &mut App) {
     let viewer_content = draw_label(f, r.viewer, "VIEWER", app.focus == Pane::Viewer);
     let md_opts = tui_markdown::Options::new(MarkdownTheme);
     let doc = tui_markdown::from_str_with_options(&app.doc, &md_opts);
-    f.render_widget(
-        Paragraph::new(doc).scroll((app.scroll, 0)),
-        viewer_content,
-    );
+    f.render_widget(Paragraph::new(doc).scroll((app.scroll, 0)), viewer_content);
 
     // Embedded shell — real PTY rendered live.
     draw_label(f, r.shell, "SHELL", app.focus == Pane::Shell);
     f.render_widget(PseudoTerminal::new(app.shell.screen()), shell_content);
 
     draw_statusline(f, r.status, app);
+}
+
+/// Whether the statusline should show git for the selected project, and what.
+/// Returns `Some((branch, dirty))` only when the snapshot was computed for the
+/// path currently selected — guarding against showing the previous project's
+/// branch for the frame between a nav move and the poller catching up. Extracted
+/// from `draw_statusline` so the staleness rule is unit-testable.
+fn should_show_git<'a>(snap: &'a Snapshot, selected: &Path) -> Option<(&'a str, TreeState)> {
+    if snap.git_path == selected
+        && let GitState::Repo { branch, dirty } = &snap.git
+    {
+        Some((branch.as_str(), *dirty))
+    } else {
+        None
+    }
 }
 
 /// Single quiet row of segments divided by thin vertical rules — not a powerline.
@@ -319,7 +338,10 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     // segments left-pack and clip before they can reach it.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(hint.len() as u16 + 1)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(hint.len() as u16 + 1),
+        ])
         .split(area);
 
     let mut spans = vec![
@@ -334,9 +356,7 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     // Git: only when the snapshot describes the *currently selected* project, so
     // switching never shows the previous project's branch. Clean, dirty, and an
     // errored check are three distinct, affirmative marks.
-    if s.git_path == project_path(app.projects[app.selected])
-        && let GitState::Repo { branch, dirty } = &s.git
-    {
+    if let Some((branch, dirty)) = should_show_git(&s, &project_path(app.projects[app.selected])) {
         spans.push(Span::styled(format!("  {branch}"), dim));
         spans.push(match dirty {
             TreeState::Dirty => Span::styled(" ●", Style::default().fg(Theme::GLOW_AMBER)),
@@ -374,7 +394,21 @@ fn fmt_mem(used: u64, total: u64) -> String {
     format!("mem {:.1}/{:.0}G", used as f64 / GIB, total as f64 / GIB)
 }
 
+/// Chain a panic hook *after* `ratatui::init()` has installed its restore hook:
+/// log the payload first, then defer to the original (which restores the terminal
+/// and prints the panic), so a crash leaves a trace and never wedges the terminal.
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error(&format!("panic: {info}"));
+        original(info);
+    }));
+}
+
 fn main() -> Result<()> {
+    log::init();
+    log::info("aetherspace starting");
+
     // Do all fallible setup BEFORE entering the alternate screen. ratatui::init()
     // installs a panic hook that restores the terminal on panic, but an Err from
     // `?` is not a panic, so a failure between init() and restore() would skip
@@ -384,12 +418,22 @@ fn main() -> Result<()> {
     let mut app = App::new(shell);
 
     let mut terminal = ratatui::init();
+    install_panic_hook();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
+    if let Err(e) = &result {
+        log::error(&format!("exited with error: {e}"));
+    }
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+/// Generic over the ratatui `Backend`: the renderer seam. `DefaultTerminal`'s
+/// backend errors are `io::Error` (satisfying the bound), so `main()` is unchanged;
+/// the payoff is the future native frontend and `TestBackend`-driven render tests.
+fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     while app.running {
         terminal.draw(|f| draw(f, app))?;
         if event::poll(TICK)?
@@ -400,4 +444,83 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `regions` and `content_area` are pure functions of a `Rect`, so we test the
+    // layout math directly rather than through `TestBackend` — same coverage, no
+    // live terminal. The `Backend` seam exists for the native path and for future
+    // `draw()` render tests, which would need a `TestBackend` Frame.
+
+    #[test]
+    fn regions_layout_120x40() {
+        let r = regions(Rect::new(0, 0, 120, 40));
+        assert_eq!(r.nav.width, NAV_WIDTH, "nav rail width");
+        assert_eq!(r.status.height, 1, "statusline is one row");
+        assert_eq!(r.vsep.width, 1, "vertical separator is one cell");
+        assert_eq!(r.hsep.height, 1, "horizontal separator is one row");
+        // nav rail, then PANE_GAP cols of air, then the 1-col separator.
+        assert_eq!(r.nav.x + r.nav.width + PANE_GAP, r.vsep.x);
+        // viewer / hsep / shell exactly fill the body (height minus the statusline).
+        let body_h = 40 - r.status.height;
+        assert_eq!(r.viewer.height + r.hsep.height + r.shell.height, body_h);
+        // ~50/50: the viewer takes Percentage(50) of the whole body, the 1-row
+        // separator comes out of the remainder, so the shell trails by up to the
+        // separator height plus odd-parity rounding (2 rows at this geometry).
+        assert!((r.viewer.height as i32 - r.shell.height as i32).abs() <= 2);
+    }
+
+    #[test]
+    fn content_area_drops_exactly_one_top_row() {
+        let area = Rect::new(2, 3, 40, 10);
+        let c = content_area(area);
+        assert_eq!(c.y, area.y + 1);
+        assert_eq!(c.height, area.height - 1);
+        assert_eq!(c.x, area.x);
+        assert_eq!(c.width, area.width);
+    }
+
+    #[test]
+    fn fmt_mem_formats_gib() {
+        let gib = 1024u64 * 1024 * 1024;
+        assert_eq!(fmt_mem(4 * gib + gib / 2, 16 * gib), "mem 4.5/16G");
+    }
+
+    #[test]
+    fn fmt_mem_zero_total_does_not_panic() {
+        let _ = fmt_mem(0, 0); // float division, so no div-by-zero
+    }
+
+    #[test]
+    fn should_show_git_returns_branch_when_path_matches() {
+        let p = PathBuf::from("/x/y");
+        let snap = Snapshot {
+            git: GitState::Repo {
+                branch: "main".into(),
+                dirty: TreeState::Clean,
+            },
+            git_path: p.clone(),
+            ..Snapshot::default()
+        };
+        assert!(matches!(
+            should_show_git(&snap, &p),
+            Some(("main", TreeState::Clean))
+        ));
+    }
+
+    #[test]
+    fn should_show_git_is_none_when_path_mismatches() {
+        let snap = Snapshot {
+            git: GitState::Repo {
+                branch: "main".into(),
+                dirty: TreeState::Dirty,
+            },
+            git_path: PathBuf::from("/a"),
+            ..Snapshot::default()
+        };
+        assert!(should_show_git(&snap, Path::new("/b")).is_none());
+    }
 }

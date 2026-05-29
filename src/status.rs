@@ -21,9 +21,9 @@ const SPARK_HEALTH_URL: &str = "http://localhost:9292/health";
 /// A single coherent reading published to the render loop.
 #[derive(Clone)]
 pub struct Snapshot {
-    pub cpu: f32,        // global CPU usage, 0..=100
-    pub mem_used: u64,   // bytes
-    pub mem_total: u64,  // bytes
+    pub cpu: f32,       // global CPU usage, 0..=100
+    pub mem_used: u64,  // bytes
+    pub mem_total: u64, // bytes
     pub git: GitState,
     pub git_path: PathBuf, // the project dir `git` was computed for (stale guard)
     pub spark: Health,
@@ -92,10 +92,7 @@ impl StatusMonitor {
 
     /// The most recent snapshot. The lock is held only long enough to clone.
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.snapshot.lock().map(|s| s.clone()).unwrap_or_default()
     }
 }
 

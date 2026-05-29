@@ -5,11 +5,11 @@
 //! Screen type always matches the widget's expected version.
 
 use std::io::{Read, Write};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 use anyhow::Result;
-use portable_pty::{native_pty_system, CommandBuilder, Child, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_term::vt100;
 
@@ -35,7 +35,9 @@ impl Shell {
             pixel_height: 0,
         })?;
 
-        let child = pair.slave.spawn_command(CommandBuilder::new_default_prog())?;
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new_default_prog())?;
         // Drop the slave so the child receives EOF cleanly when it exits.
         drop(pair.slave);
 
@@ -132,5 +134,54 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_letters_map_to_control_bytes() {
+        assert_eq!(encode_key(ctrl(KeyCode::Char('a'))), vec![0x01]);
+        assert_eq!(encode_key(ctrl(KeyCode::Char('z'))), vec![0x1a]);
+        // case-insensitive: Ctrl-C is 0x03 regardless of shift.
+        assert_eq!(encode_key(ctrl(KeyCode::Char('C'))), vec![0x03]);
+    }
+
+    #[test]
+    fn enter_and_backspace() {
+        assert_eq!(encode_key(key(KeyCode::Enter)), vec![b'\r']);
+        assert_eq!(encode_key(key(KeyCode::Backspace)), vec![0x7f]);
+    }
+
+    #[test]
+    fn arrows_emit_csi() {
+        assert_eq!(encode_key(key(KeyCode::Up)), b"\x1b[A".to_vec());
+        assert_eq!(encode_key(key(KeyCode::Down)), b"\x1b[B".to_vec());
+        assert_eq!(encode_key(key(KeyCode::Right)), b"\x1b[C".to_vec());
+        assert_eq!(encode_key(key(KeyCode::Left)), b"\x1b[D".to_vec());
+    }
+
+    #[test]
+    fn plain_char_is_its_byte() {
+        assert_eq!(encode_key(key(KeyCode::Char('a'))), vec![b'a']);
+    }
+
+    #[test]
+    fn multibyte_char_is_utf8() {
+        assert_eq!(encode_key(key(KeyCode::Char('é'))), "é".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn unmapped_key_is_empty() {
+        assert!(encode_key(key(KeyCode::F(5))).is_empty());
     }
 }

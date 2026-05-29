@@ -15,14 +15,14 @@ use std::{env, fs, path::PathBuf};
 use anyhow::Result;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
     Frame,
 };
 use shell::{encode_key, Shell};
-use status::{GitState, Health, StatusMonitor};
+use status::{GitState, Health, StatusMonitor, TreeState};
 use theme::Theme;
 use tui_term::widget::PseudoTerminal;
 
@@ -264,12 +264,20 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.status.snapshot();
     let dim = Style::default().fg(Theme::DIM);
+    let bg = Style::default().bg(Theme::BG);
     let sep = Span::styled(" │ ", Style::default().fg(Theme::HAIR));
     let hint = if app.focus == Pane::Shell {
         "tab: release shell"
     } else {
         "tab: focus   q: quit"
     };
+
+    // Reserve the right edge for the hint so it always survives; the status
+    // segments left-pack and clip before they can reach it.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(hint.len() as u16 + 1)])
+        .split(area);
 
     let mut spans = vec![
         Span::styled(
@@ -280,33 +288,42 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(app.projects[app.selected], Style::default().fg(Theme::FG)),
     ];
 
-    // Git: dim branch name, amber dot only when the working tree is dirty.
-    if let GitState::Repo { branch, dirty } = &s.git {
+    // Git: only when the snapshot describes the *currently selected* project, so
+    // switching never shows the previous project's branch. Clean, dirty, and an
+    // errored check are three distinct, affirmative marks.
+    if s.git_path == project_path(app.projects[app.selected])
+        && let GitState::Repo { branch, dirty } = &s.git
+    {
         spans.push(Span::styled(format!("  {branch}"), dim));
-        if *dirty {
-            spans.push(Span::styled(" ●", Style::default().fg(Theme::GLOW_AMBER)));
-        }
+        spans.push(match dirty {
+            TreeState::Dirty => Span::styled(" ●", Style::default().fg(Theme::GLOW_AMBER)),
+            TreeState::Clean => Span::styled(" ✓", dim),
+            TreeState::Unknown => Span::styled(" ?", Style::default().fg(Theme::GLOW_MAGENTA)),
+        });
     }
 
     spans.push(sep.clone());
     spans.push(Span::styled(format!("cpu {:.0}%", s.cpu), dim));
     spans.push(sep.clone());
     spans.push(Span::styled(fmt_mem(s.mem_used, s.mem_total), dim));
-    spans.push(sep.clone());
-
-    // Spark health: green when reachable, dim otherwise (down or not yet probed).
-    let dot = match s.spark {
-        Health::Up => Style::default().fg(Theme::GLOW_GREEN),
-        Health::Down | Health::Unknown => dim,
-    };
-    spans.push(Span::styled("●", dot));
-    spans.push(Span::styled(" spark", dim));
     spans.push(sep);
-    spans.push(Span::styled(hint, dim));
 
+    // Spark health: green = reachable, magenta = down (clearly bad), dim = not
+    // yet probed (genuinely no data, distinct from down).
+    let spark = match s.spark {
+        Health::Up => Style::default().fg(Theme::GLOW_GREEN),
+        Health::Down => Style::default().fg(Theme::GLOW_MAGENTA),
+        Health::Unknown => dim,
+    };
+    spans.push(Span::styled("●", spark));
+    spans.push(Span::styled(" spark", dim));
+
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bg), cols[0]);
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(Theme::BG)),
-        area,
+        Paragraph::new(Line::from(Span::styled(hint, dim)))
+            .alignment(Alignment::Right)
+            .style(bg),
+        cols[1],
     );
 }
 

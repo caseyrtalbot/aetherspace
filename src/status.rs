@@ -21,10 +21,11 @@ const SPARK_HEALTH_URL: &str = "http://localhost:9292/health";
 /// A single coherent reading published to the render loop.
 #[derive(Clone)]
 pub struct Snapshot {
-    pub cpu: f32,       // global CPU usage, 0..=100
-    pub mem_used: u64,  // bytes
-    pub mem_total: u64, // bytes
+    pub cpu: f32,        // global CPU usage, 0..=100
+    pub mem_used: u64,   // bytes
+    pub mem_total: u64,  // bytes
     pub git: GitState,
+    pub git_path: PathBuf, // the project dir `git` was computed for (stale guard)
     pub spark: Health,
 }
 
@@ -35,6 +36,7 @@ impl Default for Snapshot {
             mem_used: 0,
             mem_total: 0,
             git: GitState::None,
+            git_path: PathBuf::new(),
             spark: Health::Unknown,
         }
     }
@@ -44,7 +46,16 @@ impl Default for Snapshot {
 #[derive(Clone)]
 pub enum GitState {
     None,
-    Repo { branch: String, dirty: bool },
+    Repo { branch: String, dirty: TreeState },
+}
+
+/// Working-tree state. `Unknown` means the dirty check itself errored, which is
+/// distinct from a confirmed-clean tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TreeState {
+    Clean,
+    Dirty,
+    Unknown,
 }
 
 /// Reachability of the Spark inference endpoint. `Unknown` until the first probe.
@@ -107,12 +118,14 @@ fn poll_loop(snapshot: Arc<Mutex<Snapshot>>, selected: Arc<Mutex<PathBuf>>) {
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         let path = selected.lock().map(|p| p.clone()).unwrap_or_default();
+        let git = read_git(&path);
 
         let next = Snapshot {
             cpu: sys.global_cpu_usage(),
             mem_used: sys.used_memory(),
             mem_total: sys.total_memory(),
-            git: read_git(&path),
+            git,
+            git_path: path,
             spark: probe(&agent),
         };
 
@@ -139,7 +152,11 @@ fn read_git(path: &Path) -> GitState {
         Ok(Some(name)) => name.shorten().to_string(),
         _ => "detached".to_string(), // detached HEAD or no commits yet
     };
-    let dirty = repo.is_dirty().unwrap_or(false);
+    let dirty = match repo.is_dirty() {
+        Ok(true) => TreeState::Dirty,
+        Ok(false) => TreeState::Clean,
+        Err(_) => TreeState::Unknown, // surface the failure rather than faking "clean"
+    };
     GitState::Repo { branch, dirty }
 }
 

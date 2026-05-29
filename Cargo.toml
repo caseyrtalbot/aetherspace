@@ -1,0 +1,17 @@
+[package]
+name = "aetherspace"
+version = "0.1.0"
+edition = "2024"
+description = "A personal command-center terminal built with Ratatui: project navigation, a markdown and script viewer, an embedded shell, and a clean statusline."
+license = "MIT"
+authors = ["Casey Talbot <caseyrtalbot@gmail.com>"]
+readme = "README.md"
+keywords = ["tui", "terminal", "ratatui", "command-center"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.102"
+portable-pty = "0.9.0"
+ratatui = "0.30"
+tui-markdown = "0.3.7"
+tui-term = "0.3.4"

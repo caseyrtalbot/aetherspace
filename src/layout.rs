@@ -133,7 +133,10 @@ mod tests {
         };
         let out = solve(&tree, area);
         assert_eq!(out.len(), 3);
-        let covered: u32 = out.iter().map(|(_, r)| r.width as u32 * r.height as u32).sum();
+        let covered: u32 = out
+            .iter()
+            .map(|(_, r)| r.width as u32 * r.height as u32)
+            .sum();
         assert_eq!(covered, 100 * 30, "leaves cover the area exactly");
     }
 }

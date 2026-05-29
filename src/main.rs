@@ -36,6 +36,7 @@ use shell::{Shell, encode_key};
 use status::{GitState, Health, Snapshot, StatusMonitor, TreeState};
 use theme::{MarkdownTheme, Theme};
 use tui_term::widget::PseudoTerminal;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The render-rate cap: under heavy PTY output we coalesce bursts and draw at
 /// most once per frame (~60fps). At idle the loop blocks on the channel and never
@@ -438,56 +439,152 @@ fn should_show_git<'a>(snap: &'a Snapshot, selected: &Path) -> Option<(&'a str, 
     }
 }
 
+/// Drop priority for a statusline segment. Higher survives a narrow row longer.
+/// Title and project are non-negotiable; git is informative; the host gauges are
+/// the first to go when columns run short.
+const PRIO_TITLE: u8 = 3;
+const PRIO_PROJECT: u8 = 3;
+const PRIO_GIT: u8 = 2;
+const PRIO_GAUGE: u8 = 1;
+
+/// Cap a branch name at this many display columns before it enters the budget, so
+/// one long branch can't shove the host gauges off on its own.
+const BRANCH_MAX_W: u16 = 24;
+
+/// Which left-to-right segments fit `budget` columns, given each segment's
+/// `(priority, display_width)`. Drops lowest priority first; among equal priority
+/// drops the rightmost (highest index) first, so the row collapses toward the
+/// high-priority left edge. Pure, so the drop policy is unit-tested without a
+/// `Frame`. Returns a keep-mask aligned with the input.
+fn fit_segments(segs: &[(u8, u16)], budget: u16) -> Vec<bool> {
+    let mut keep = vec![true; segs.len()];
+    let mut total: u32 = segs.iter().map(|&(_, w)| w as u32).sum();
+    let budget = budget as u32;
+    if total <= budget {
+        return keep;
+    }
+    // Drop order: priority ascending (lowest first), then index descending
+    // (rightmost first) to break ties.
+    let mut order: Vec<usize> = (0..segs.len()).collect();
+    order.sort_by(|&a, &b| segs[a].0.cmp(&segs[b].0).then(b.cmp(&a)));
+    for i in order {
+        if total <= budget {
+            break;
+        }
+        keep[i] = false;
+        total -= segs[i].1 as u32;
+    }
+    keep
+}
+
+/// Truncate `s` to at most `max` display columns, appending `…` when cut. Uses
+/// Unicode display width (not byte length) so multi-byte branch names budget
+/// correctly. `max == 0` yields an empty string.
+fn truncate_width(s: &str, max: u16) -> String {
+    let max = max as usize;
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis (none available → empty).
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out
+}
+
+/// Total display width of a segment's spans, in columns.
+fn segment_width(spans: &[Span]) -> u16 {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+        .sum()
+}
+
 /// Single quiet row of segments divided by thin vertical rules — not a powerline.
 /// Accent is reserved for selection/focus; the live spark dot reads glow-green.
+///
+/// Segments are assembled with explicit drop priorities and fit to the column
+/// budget left of the hint: when the row is too narrow the host gauges drop
+/// first, then git, while the title and project always survive. Each segment
+/// carries its own leading separator, so a dropped segment takes its rule with
+/// it and the row stays clean. This replaces the renderer's silent `Min(0)`
+/// truncation, which let a wide branch collide with the gauges.
 fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.status.snapshot();
     let dim = Style::default().fg(Theme::DIM);
-    let sep = Span::styled(" │ ", Style::default().fg(Theme::HAIR));
+    let sep = || Span::styled(" │ ", Style::default().fg(Theme::HAIR));
     let hint = if app.focus == Pane::Shell {
         "tab: release shell"
     } else {
         "tab: focus   q: quit"
     };
 
-    // Reserve the right edge for the hint so it always survives; the status
-    // segments left-pack and clip before they can reach it.
+    // Reserve the right edge for the hint (by display width) so it always
+    // survives; the prioritized segments fit into the remaining columns.
+    let hint_w = UnicodeWidthStr::width(hint) as u16;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(hint.len() as u16 + 1),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(hint_w + 1)])
         .split(area);
 
     let selected = app.selected_project();
     let project_name = selected.map(|p| p.name.as_str()).unwrap_or("(no project)");
-    let mut spans = vec![
-        Span::styled(
-            " Aetherspace ",
-            Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
+
+    // (priority, spans) in left-to-right order. Each gauge and the project carry
+    // a leading rule; git attaches to the project with two spaces (no rule).
+    let mut segs: Vec<(u8, Vec<Span>)> = vec![
+        (
+            PRIO_TITLE,
+            vec![Span::styled(
+                " Aetherspace ",
+                Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
+            )],
         ),
-        sep.clone(),
-        Span::styled(project_name, Style::default().fg(Theme::FG)),
+        (
+            PRIO_PROJECT,
+            vec![
+                sep(),
+                Span::styled(project_name, Style::default().fg(Theme::FG)),
+            ],
+        ),
     ];
 
     // Git: only when the snapshot describes the *currently selected* project, so
-    // switching never shows the previous project's branch. Clean, dirty, and an
-    // errored check are three distinct, affirmative marks.
+    // switching never shows the previous project's branch. The branch is bounded
+    // to a max display width so one long name can't crowd out the gauges. Clean,
+    // dirty, and an errored check are three distinct, affirmative marks.
     if let Some((branch, dirty)) = selected.and_then(|p| should_show_git(&s, &p.path)) {
-        spans.push(Span::styled(format!("  {branch}"), dim));
-        spans.push(match dirty {
+        let branch = truncate_width(branch, BRANCH_MAX_W);
+        let mark = match dirty {
             TreeState::Dirty => Span::styled(" ●", Style::default().fg(Theme::GLOW_AMBER)),
             TreeState::Clean => Span::styled(" ✓", dim),
             TreeState::Unknown => Span::styled(" ?", Style::default().fg(Theme::GLOW_MAGENTA)),
-        });
+        };
+        segs.push((
+            PRIO_GIT,
+            vec![Span::styled(format!("  {branch}"), dim), mark],
+        ));
     }
 
-    spans.push(sep.clone());
-    spans.push(Span::styled(format!("cpu {:.0}%", s.cpu), dim));
-    spans.push(sep.clone());
-    spans.push(Span::styled(fmt_mem(s.mem_used, s.mem_total), dim));
-    spans.push(sep);
+    segs.push((
+        PRIO_GAUGE,
+        vec![sep(), Span::styled(format!("cpu {:.0}%", s.cpu), dim)],
+    ));
+    segs.push((
+        PRIO_GAUGE,
+        vec![sep(), Span::styled(fmt_mem(s.mem_used, s.mem_total), dim)],
+    ));
 
     // Spark health: green = reachable, magenta = down (clearly bad), dim = not
     // yet probed (genuinely no data, distinct from down).
@@ -496,8 +593,19 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
         Health::Down => Style::default().fg(Theme::GLOW_MAGENTA),
         Health::Unknown => dim,
     };
-    spans.push(Span::styled("●", spark));
-    spans.push(Span::styled(" spark", dim));
+    segs.push((
+        PRIO_GAUGE,
+        vec![sep(), Span::styled("●", spark), Span::styled(" spark", dim)],
+    ));
+
+    let widths: Vec<(u8, u16)> = segs.iter().map(|(p, sp)| (*p, segment_width(sp))).collect();
+    let keep = fit_segments(&widths, cols[0].width);
+    let spans: Vec<Span> = segs
+        .into_iter()
+        .zip(keep)
+        .filter_map(|((_, sp), keep)| keep.then_some(sp))
+        .flatten()
+        .collect();
 
     f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
     f.render_widget(
@@ -713,6 +821,68 @@ mod tests {
             should_show_git(&snap, &p),
             Some(("main", TreeState::Clean))
         ));
+    }
+
+    #[test]
+    fn fit_segments_keeps_all_when_budget_ample() {
+        // title=11, project=10, gauge=8 → 29 cols, budget 80.
+        let segs = [(PRIO_TITLE, 11), (PRIO_PROJECT, 10), (PRIO_GAUGE, 8)];
+        assert_eq!(fit_segments(&segs, 80), vec![true, true, true]);
+    }
+
+    #[test]
+    fn fit_segments_drops_low_priority_first() {
+        // Total 29, budget 22 → must shed 7+. The gauge (prio 1) drops; the
+        // high-priority title/project survive.
+        let segs = [(PRIO_TITLE, 11), (PRIO_PROJECT, 10), (PRIO_GAUGE, 8)];
+        assert_eq!(fit_segments(&segs, 22), vec![true, true, false]);
+    }
+
+    #[test]
+    fn fit_segments_drops_rightmost_among_equal_priority() {
+        // Three equal-priority gauges (width 8 each = 24); budget 17 forces one
+        // drop. The rightmost goes first, collapsing toward the left.
+        let segs = [(PRIO_GAUGE, 8), (PRIO_GAUGE, 8), (PRIO_GAUGE, 8)];
+        assert_eq!(fit_segments(&segs, 17), vec![true, true, false]);
+    }
+
+    #[test]
+    fn fit_segments_high_priority_survives_narrow_budget() {
+        // Budget fits only the two high-priority segments; git (mid) and both
+        // gauges (low) drop, low-first.
+        let segs = [
+            (PRIO_TITLE, 11),
+            (PRIO_PROJECT, 10),
+            (PRIO_GIT, 9),
+            (PRIO_GAUGE, 8),
+            (PRIO_GAUGE, 8),
+        ];
+        assert_eq!(
+            fit_segments(&segs, 21),
+            vec![true, true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn truncate_width_leaves_short_unchanged() {
+        assert_eq!(truncate_width("main", 24), "main");
+        assert_eq!(truncate_width("main", 4), "main"); // exact fit, no ellipsis
+    }
+
+    #[test]
+    fn truncate_width_truncates_wide_with_ellipsis() {
+        // 12 ASCII cols capped at 8 → 7 chars + '…' = 8 display cols.
+        let out = truncate_width("feature/very-long-branch", 8);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 8);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_width_respects_display_width_of_multibyte() {
+        // Each CJK char is 2 display cols. Cap 5 → 2 chars (4 cols) + '…' = 5.
+        let out = truncate_width("日本語テスト", 5);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+        assert_eq!(out, "日本…");
     }
 
     #[test]

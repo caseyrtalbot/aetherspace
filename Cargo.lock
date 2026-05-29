@@ -16,6 +16,7 @@ dependencies = [
  "toml",
  "tui-markdown",
  "tui-term",
+ "unicode-width",
  "ureq",
 ]
 

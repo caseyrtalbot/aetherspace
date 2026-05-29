@@ -16,14 +16,15 @@ identity lives in `src/theme.rs`, so re-theming is a one-file edit.
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Cycle focus: Projects -> Viewer -> Shell |
+| `Tab` | Cycle focus: Projects -> Viewer -> Shell (global, works from anywhere) |
 | `j` / `k` or arrows | Move selection (Projects) or scroll (Viewer) |
 | `PageUp` / `PageDown` | Scroll the viewer faster |
-| `Ctrl+]` | Release focus from the shell back to the app |
 | `q` / `Esc` | Quit (when the shell is not focused) |
 
-When the shell is focused, keystrokes go to the real shell. `Ctrl+]` is the one
-reserved chord to step back out, chosen so macOS media keys never swallow it.
+When the shell is focused, keystrokes go to the real shell, with one exception:
+`Tab` always cycles focus, so you can never get trapped in the shell. The
+tradeoff is that the embedded shell does not receive `Tab`, so shell
+tab-completion is unavailable. A future capture mode will restore it.
 
 ## Stack
 

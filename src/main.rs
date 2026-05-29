@@ -1,9 +1,9 @@
 //! Aetherspace — a personal Ratatui command-center terminal.
 //!
 //! Phase 2b: the SHELL region now hosts a real `$SHELL` running in a PTY,
-//! rendered live via tui-term. Focus the shell to type into it; F12 releases
-//! focus back to the app so you're never trapped. Nav rail and viewer remain
-//! placeholders for Phase 2c.
+//! rendered live via tui-term. Focus the shell to type into it; `Tab` is a
+//! global key that always cycles focus, so you're never trapped in the shell.
+//! Nav rail and viewer remain placeholders for Phase 2c.
 
 mod shell;
 mod theme;
@@ -13,7 +13,7 @@ use std::{env, fs, path::PathBuf};
 
 use anyhow::Result;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -105,25 +105,25 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        // When the shell is focused, almost everything goes to the PTY. Ctrl+]
-        // is the one reserved release chord — telnet-style, and unlike F-keys it
-        // isn't a macOS media key, so the OS never swallows it.
+        // Tab is a global focus key: it always cycles panes, even out of the
+        // shell, so you can never get trapped. Cost: the embedded shell never
+        // receives Tab, so shell tab-completion is unavailable (see README).
+        if key.code == KeyCode::Tab {
+            self.focus = self.focus.next();
+            return;
+        }
+
+        // When the shell is focused, every other key goes straight to the PTY.
         if self.focus == Pane::Shell {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            if ctrl && key.code == KeyCode::Char(']') {
-                self.focus = Pane::Nav;
-            } else {
-                let bytes = encode_key(key);
-                if !bytes.is_empty() {
-                    self.shell.send_input(&bytes);
-                }
+            let bytes = encode_key(key);
+            if !bytes.is_empty() {
+                self.shell.send_input(&bytes);
             }
             return;
         }
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::Down | KeyCode::Char('j') if self.focus == Pane::Nav => {
                 if self.selected + 1 < self.projects.len() {
                     self.select(self.selected + 1);
@@ -257,7 +257,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let sep = Span::styled(" │ ", Style::default().fg(Theme::HAIR));
     let hint = if app.focus == Pane::Shell {
-        "ctrl+] : release shell"
+        "tab: release shell"
     } else {
         "tab: focus   q: quit"
     };
@@ -298,12 +298,11 @@ fn main() -> Result<()> {
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     while app.running {
         terminal.draw(|f| draw(f, app))?;
-        if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
-                }
-            }
+        if event::poll(TICK)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.on_key(key);
         }
     }
     Ok(())

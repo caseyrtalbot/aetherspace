@@ -12,6 +12,7 @@ mod shell;
 mod status;
 mod theme;
 
+use std::borrow::Cow;
 use std::time::Duration;
 use std::{
     env, fs,
@@ -25,8 +26,8 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     layout::{Alignment, Constraint, Direction, Layout, Rect, Spacing},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
+    text::{Line, Span, Text},
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use shell::{Shell, encode_key};
 use status::{GitState, Health, Snapshot, StatusMonitor, TreeState};
@@ -76,12 +77,60 @@ fn load_doc(name: &str) -> String {
     )
 }
 
+/// Load a project's doc and parse it into an owned, render-ready `Text`, plus its
+/// line count for scroll clamping. Parsing happens here (on nav selection), not
+/// per frame: the markdown pass was the largest single per-frame allocation in
+/// the old 60fps loop. The cached `Text` borrows nothing, so it lives on `App`.
+fn render_doc(name: &str) -> (Text<'static>, usize) {
+    let raw = load_doc(name);
+    let opts = tui_markdown::Options::new(MarkdownTheme);
+    let text = into_static(tui_markdown::from_str_with_options(&raw, &opts));
+    let lines = text.lines.len();
+    (text, lines)
+}
+
+/// Map a borrowed `Text` (tui-markdown returns one tied to its input `&str`) into
+/// a `'static` one by owning every span's content, so it can be cached without a
+/// self-referential borrow of the source string.
+fn into_static(text: Text<'_>) -> Text<'static> {
+    let lines = text
+        .lines
+        .into_iter()
+        .map(|line| Line {
+            spans: line
+                .spans
+                .into_iter()
+                .map(|s| Span {
+                    style: s.style,
+                    content: Cow::Owned(s.content.into_owned()),
+                })
+                .collect(),
+            style: line.style,
+            alignment: line.alignment,
+        })
+        .collect();
+    Text {
+        lines,
+        style: text.style,
+        alignment: text.alignment,
+    }
+}
+
+/// Clamp a viewer scroll offset so it can never run past the document end (which
+/// would blank the pane): the maximum offset leaves the last line at the viewport
+/// bottom. Pure, so it's unit-tested and used as the single clamp in `draw`.
+fn clamp_scroll(scroll: u16, total_lines: usize, viewport_h: u16) -> u16 {
+    let total = total_lines.min(u16::MAX as usize) as u16;
+    scroll.min(total.saturating_sub(viewport_h))
+}
+
 struct App {
     running: bool,
     focus: Pane,
     projects: Vec<&'static str>,
     selected: usize,
-    doc: String,
+    doc_text: Text<'static>, // parsed once on select(), not per frame
+    doc_lines: usize,        // cached line count for scroll clamping
     scroll: u16,
     shell: Shell,
     status: StatusMonitor,
@@ -95,14 +144,15 @@ impl App {
             "field-theory-cli",
             "aetherspace",
         ];
-        let doc = load_doc(projects[0]);
+        let (doc_text, doc_lines) = render_doc(projects[0]);
         let status = StatusMonitor::spawn(project_path(projects[0]));
         Self {
             running: true,
             focus: Pane::Nav,
             projects,
             selected: 0,
-            doc,
+            doc_text,
+            doc_lines,
             scroll: 0,
             shell,
             status,
@@ -113,7 +163,9 @@ impl App {
     /// poller so git/health reflect the newly selected project.
     fn select(&mut self, index: usize) {
         self.selected = index;
-        self.doc = load_doc(self.projects[index]);
+        let (doc_text, doc_lines) = render_doc(self.projects[index]);
+        self.doc_text = doc_text;
+        self.doc_lines = doc_lines;
         self.scroll = 0;
         self.status.set_selected(project_path(self.projects[index]));
     }
@@ -293,12 +345,31 @@ fn draw(f: &mut Frame, app: &mut App) {
         .collect();
     f.render_widget(Paragraph::new(nav_lines), nav_content);
 
-    // Content viewer — selected project's doc as markdown, styled foreground-only
-    // (no background patches), scrollable when focused.
+    // Content viewer — selected project's doc as cached markdown, styled
+    // foreground-only (no background patches), scrollable when focused. The parse
+    // is cached on App (see render_doc); here we clamp the scroll against the
+    // viewport and render. Clamping in draw (writing back to app.scroll) is the
+    // single source of truth, so key handlers can't drift the offset past the end.
     let viewer_content = draw_label(f, r.viewer, "VIEWER", app.focus == Pane::Viewer);
-    let md_opts = tui_markdown::Options::new(MarkdownTheme);
-    let doc = tui_markdown::from_str_with_options(&app.doc, &md_opts);
-    f.render_widget(Paragraph::new(doc).scroll((app.scroll, 0)), viewer_content);
+    app.scroll = clamp_scroll(app.scroll, app.doc_lines, viewer_content.height);
+    f.render_widget(
+        Paragraph::new(app.doc_text.clone()).scroll((app.scroll, 0)),
+        viewer_content,
+    );
+    // A thin scrollbar, only when the doc overflows the viewport. Track on the
+    // hairline color, thumb dim — quiet, consistent with the borderless ethos.
+    if app.doc_lines > viewer_content.height as usize {
+        let mut sb = ScrollbarState::new(app.doc_lines).position(app.scroll as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(Theme::DIM))
+                .track_style(Style::default().fg(Theme::HAIR)),
+            viewer_content,
+            &mut sb,
+        );
+    }
 
     // Embedded shell — real PTY rendered live.
     draw_label(f, r.shell, "SHELL", app.focus == Pane::Shell);
@@ -471,6 +542,24 @@ mod tests {
         // separator comes out of the remainder, so the shell trails by up to the
         // separator height plus odd-parity rounding (2 rows at this geometry).
         assert!((r.viewer.height as i32 - r.shell.height as i32).abs() <= 2);
+    }
+
+    #[test]
+    fn clamp_scroll_clamps_past_end() {
+        // 100 lines, 40-row viewport → max offset 60.
+        assert_eq!(clamp_scroll(500, 100, 40), 60);
+        assert_eq!(clamp_scroll(60, 100, 40), 60);
+    }
+
+    #[test]
+    fn clamp_scroll_leaves_in_range_untouched() {
+        assert_eq!(clamp_scroll(10, 100, 40), 10);
+    }
+
+    #[test]
+    fn clamp_scroll_zero_when_content_fits() {
+        // Fewer lines than the viewport → no scrolling.
+        assert_eq!(clamp_scroll(5, 30, 40), 0);
     }
 
     #[test]

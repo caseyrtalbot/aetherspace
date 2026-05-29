@@ -23,7 +23,7 @@ use ratatui::{
 };
 use shell::{encode_key, Shell};
 use status::{GitState, Health, StatusMonitor, TreeState};
-use theme::Theme;
+use theme::{MarkdownTheme, Theme};
 use tui_term::widget::PseudoTerminal;
 
 /// Tick between frames; also the input poll timeout, so shell output renders
@@ -286,10 +286,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         .collect();
     f.render_widget(Paragraph::new(nav_lines), nav_content);
 
-    // Content viewer — selected project's doc as markdown (syntect-highlighted),
-    // scrollable when focused.
+    // Content viewer — selected project's doc as markdown, styled foreground-only
+    // (no background patches), scrollable when focused.
     let viewer_content = draw_label(f, r.viewer, "VIEWER", app.focus == Pane::Viewer);
-    let doc = tui_markdown::from_str(&app.doc);
+    let md_opts = tui_markdown::Options::new(MarkdownTheme);
+    let doc = tui_markdown::from_str_with_options(&app.doc, &md_opts);
     f.render_widget(
         Paragraph::new(doc).scroll((app.scroll, 0)),
         viewer_content,

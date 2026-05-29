@@ -22,7 +22,7 @@ impl Theme {
     pub const BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a); // recommended terminal bg (not painted)
     pub const FG: Color = Color::Rgb(0xed, 0xed, 0xed); // white ink
     pub const DIM: Color = Color::Rgb(0x6b, 0x6b, 0x6b); // labels, inactive
-    pub const HAIR: Color = Color::Rgb(0x2a, 0x26, 0x22); // warm-tinted 1px hairline
+    pub const HAIR: Color = Color::Rgb(0x57, 0x50, 0x4a); // warm-tinted 1px hairline (visible on jet black)
 
     // --- The one accent: retro orange ---
     pub const ACCENT: Color = Color::Rgb(0xff, 0x7a, 0x1a); // the one accent: selection + focus only
@@ -47,5 +47,50 @@ impl Theme {
         Style::default()
             .fg(Self::ACCENT)
             .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Foreground-only markdown styling for the viewer. The app defers its
+/// background to the terminal, so any `on_*` (background) style would punch a
+/// colored patch into the otherwise-seamless surface. Every style here sets fg
+/// and modifiers only — hierarchy comes from the glowy-retro palette, not fills.
+/// Pairs with `tui-markdown`'s `highlight-code` feature being off, so fenced code
+/// blocks also route through `code()` instead of syntect's themed backgrounds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MarkdownTheme;
+
+impl tui_markdown::StyleSheet for MarkdownTheme {
+    fn heading(&self, level: u8) -> Style {
+        let base = Style::default().fg(Theme::GLOW_CYAN);
+        match level {
+            1 => base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            2 => base.add_modifier(Modifier::BOLD),
+            3 => base.add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            _ => base.add_modifier(Modifier::ITALIC | Modifier::DIM),
+        }
+    }
+
+    fn code(&self) -> Style {
+        Style::default().fg(Theme::GLOW_AMBER)
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(Theme::GLOW_CYAN)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default()
+            .fg(Theme::DIM)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(Theme::DIM)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(Theme::DIM)
     }
 }

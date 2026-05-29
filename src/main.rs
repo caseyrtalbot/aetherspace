@@ -1,9 +1,10 @@
 //! Aetherspace — a personal Ratatui command-center terminal.
 //!
-//! Phase 2b: the SHELL region now hosts a real `$SHELL` running in a PTY,
-//! rendered live via tui-term. Focus the shell to type into it; `Tab` is a
-//! global key that always cycles focus, so you're never trapped in the shell.
-//! Nav rail and viewer remain placeholders for Phase 2c.
+//! The SHELL region hosts a real `$SHELL` running in a PTY, rendered live via
+//! tui-term. Focus the shell to type into it; `Tab` is a global key that always
+//! cycles focus, so you're never trapped in the shell. The nav rail lists git
+//! projects discovered from the config's `projects_root` (or a pinned list), and
+//! the viewer shows the selected project's README/CLAUDE doc as cached markdown.
 
 mod clipboard;
 mod config;
@@ -11,17 +12,17 @@ mod log;
 mod shell;
 mod status;
 mod theme;
+mod xdg;
 
 use std::borrow::Cow;
+use std::fs;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
 
 use anyhow::Result;
+use config::Project;
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -70,38 +71,50 @@ impl Pane {
     }
 }
 
-/// Resolve a project name to its directory under ~/Projects.
-fn project_path(name: &str) -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default())
-        .join("Projects")
-        .join(name)
-}
-
 /// Load a project's primary doc for the viewer: README.md, else CLAUDE.md,
 /// else a friendly placeholder so the pane is never blank.
-fn load_doc(name: &str) -> String {
-    let base = project_path(name);
+fn load_doc(path: &Path) -> String {
     for candidate in ["README.md", "readme.md", "CLAUDE.md"] {
-        if let Ok(text) = fs::read_to_string(base.join(candidate)) {
+        if let Ok(text) = fs::read_to_string(path.join(candidate)) {
             return text;
         }
     }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
     format!(
         "# {name}\n\nNo `README.md` or `CLAUDE.md` found in `{}`.",
-        base.display()
+        path.display()
     )
 }
 
-/// Load a project's doc and parse it into an owned, render-ready `Text`, plus its
-/// line count for scroll clamping. Parsing happens here (on nav selection), not
-/// per frame: the markdown pass was the largest single per-frame allocation in
-/// the old 60fps loop. The cached `Text` borrows nothing, so it lives on `App`.
-fn render_doc(name: &str) -> (Text<'static>, usize) {
-    let raw = load_doc(name);
+/// Parse markdown into an owned, render-ready `Text`, plus its line count for
+/// scroll clamping. Parsing happens on nav selection, not per frame: the markdown
+/// pass was the largest single per-frame allocation in the old 60fps loop. The
+/// cached `Text` borrows nothing, so it lives on `App`.
+fn render_markdown(raw: &str) -> (Text<'static>, usize) {
     let opts = tui_markdown::Options::new(MarkdownTheme);
-    let text = into_static(tui_markdown::from_str_with_options(&raw, &opts));
+    let text = into_static(tui_markdown::from_str_with_options(raw, &opts));
     let lines = text.lines.len();
     (text, lines)
+}
+
+/// Load a project's doc and render it. Convenience wrapper over `render_markdown`.
+fn render_doc(path: &Path) -> (Text<'static>, usize) {
+    render_markdown(&load_doc(path))
+}
+
+/// The viewer doc shown when no projects were discovered: tells the user where we
+/// looked and how to fix it, instead of a blank pane.
+fn empty_state_doc(root: &Path) -> (Text<'static>, usize) {
+    render_markdown(&format!(
+        "# No projects\n\nNo git repositories were found in `{}`.\n\n\
+         Set `projects_root` (or pin a `projects` list) in your config:\n\n\
+         `~/.config/aetherspace/config.toml`\n\n\
+         See `config.example.toml` for the full format.",
+        root.display()
+    ))
 }
 
 /// Map a borrowed `Text` (tui-markdown returns one tied to its input `&str`) into
@@ -142,7 +155,7 @@ fn clamp_scroll(scroll: u16, total_lines: usize, viewport_h: u16) -> u16 {
 struct App {
     running: bool,
     focus: Pane,
-    projects: Vec<&'static str>,
+    projects: Vec<Project>,
     selected: usize,
     doc_text: Text<'static>, // parsed once on select(), not per frame
     doc_lines: usize,        // cached line count for scroll clamping
@@ -152,15 +165,16 @@ struct App {
 }
 
 impl App {
-    fn new(shell: Shell, tx: Sender<Msg>) -> Self {
-        let projects = vec![
-            "thought-engine",
-            "antigrav-explore",
-            "field-theory-cli",
-            "aetherspace",
-        ];
-        let (doc_text, doc_lines) = render_doc(projects[0]);
-        let status = StatusMonitor::spawn(project_path(projects[0]), tx);
+    /// Build the app from the discovered (or pinned) `projects`. With an empty
+    /// list the viewer shows an empty-state doc naming `root` and the poller is
+    /// pointed at no path; nav/select become no-ops (guarded by `selected_project`).
+    fn new(shell: Shell, tx: Sender<Msg>, projects: Vec<Project>, root: &Path) -> Self {
+        let (doc_text, doc_lines) = match projects.first() {
+            Some(p) => render_doc(&p.path),
+            None => empty_state_doc(root),
+        };
+        let initial = projects.first().map(|p| p.path.clone()).unwrap_or_default();
+        let status = StatusMonitor::spawn(initial, tx);
         Self {
             running: true,
             focus: Pane::Nav,
@@ -174,15 +188,24 @@ impl App {
         }
     }
 
+    /// The currently selected project, or `None` when the list is empty.
+    fn selected_project(&self) -> Option<&Project> {
+        self.projects.get(self.selected)
+    }
+
     /// Move the nav selection, load that project's doc, and repoint the status
     /// poller so git/health reflect the newly selected project.
     fn select(&mut self, index: usize) {
+        let Some(project) = self.projects.get(index) else {
+            return; // empty list: nothing to select
+        };
         self.selected = index;
-        let (doc_text, doc_lines) = render_doc(self.projects[index]);
+        let (doc_text, doc_lines) = render_doc(&project.path);
+        let path = project.path.clone();
         self.doc_text = doc_text;
         self.doc_lines = doc_lines;
         self.scroll = 0;
-        self.status.set_selected(project_path(self.projects[index]));
+        self.status.set_selected(path);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -341,24 +364,30 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Nav rail — project list, selected row in the one accent color.
     let nav_content = draw_label(f, r.nav, "PROJECTS", app.focus == Pane::Nav);
-    let nav_lines: Vec<Line> = app
-        .projects
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            if i == app.selected {
-                Line::from(Span::styled(
-                    format!("› {name}"),
-                    Style::default().fg(Theme::ACCENT),
-                ))
-            } else {
-                Line::from(Span::styled(
-                    format!("  {name}"),
-                    Style::default().fg(Theme::DIM),
-                ))
-            }
-        })
-        .collect();
+    let nav_lines: Vec<Line> = if app.projects.is_empty() {
+        vec![Line::from(Span::styled(
+            "  (none)",
+            Style::default().fg(Theme::DIM),
+        ))]
+    } else {
+        app.projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if i == app.selected {
+                    Line::from(Span::styled(
+                        format!("› {}", p.name),
+                        Style::default().fg(Theme::ACCENT),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        format!("  {}", p.name),
+                        Style::default().fg(Theme::DIM),
+                    ))
+                }
+            })
+            .collect()
+    };
     f.render_widget(Paragraph::new(nav_lines), nav_content);
 
     // Content viewer — selected project's doc as cached markdown, styled
@@ -431,19 +460,21 @@ fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
+    let selected = app.selected_project();
+    let project_name = selected.map(|p| p.name.as_str()).unwrap_or("(no project)");
     let mut spans = vec![
         Span::styled(
             " Aetherspace ",
             Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
-        Span::styled(app.projects[app.selected], Style::default().fg(Theme::FG)),
+        Span::styled(project_name, Style::default().fg(Theme::FG)),
     ];
 
     // Git: only when the snapshot describes the *currently selected* project, so
     // switching never shows the previous project's branch. Clean, dirty, and an
     // errored check are three distinct, affirmative marks.
-    if let Some((branch, dirty)) = should_show_git(&s, &project_path(app.projects[app.selected])) {
+    if let Some((branch, dirty)) = selected.and_then(|p| should_show_git(&s, &p.path)) {
         spans.push(Span::styled(format!("  {branch}"), dim));
         spans.push(match dirty {
             TreeState::Dirty => Span::styled(" ●", Style::default().fg(Theme::GLOW_AMBER)),
@@ -496,6 +527,12 @@ fn main() -> Result<()> {
     log::init();
     log::info("aetherspace starting");
 
+    // Load config (defaults if absent/invalid) and resolve the project list:
+    // pinned entries verbatim, else git discovery under projects_root.
+    let config = config::Config::load();
+    let projects = config.resolve_projects();
+    log::info(&format!("resolved {} project(s)", projects.len()));
+
     // All sources funnel into one channel; create it before the producers.
     let (tx, rx) = mpsc::channel::<Msg>();
 
@@ -505,7 +542,7 @@ fn main() -> Result<()> {
     // cleanup and leave the terminal in raw mode. Spawn with a reasonable default;
     // draw() resizes to the real pane next frame.
     let shell = Shell::spawn(24, 80, tx.clone())?;
-    let mut app = App::new(shell, tx.clone());
+    let mut app = App::new(shell, tx.clone(), projects, &config.projects_root);
 
     let mut terminal = ratatui::init();
     install_panic_hook();
@@ -595,6 +632,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     // `regions` and `content_area` are pure functions of a `Rect`, so we test the

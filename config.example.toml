@@ -1,0 +1,44 @@
+# Aetherspace configuration — example.
+#
+# Copy to:  ~/.config/aetherspace/config.toml
+#   (or $XDG_CONFIG_HOME/aetherspace/config.toml if XDG_CONFIG_HOME is set).
+#
+# Every field is optional. With no config file at all, Aetherspace runs on the
+# defaults shown below. A partial file fills the rest with defaults; a file that
+# fails to parse is ignored (logged) and the defaults are used, so a typo never
+# stops the app from starting.
+#
+# Paths are taken verbatim: a literal "~" is NOT expanded. Use absolute paths.
+
+# Directory scanned for git projects. Immediate subdirectories that contain a
+# .git entry become nav entries, sorted by .git/HEAD mtime (most recently active
+# first), with a name tiebreak. Default: ~/Projects (resolved from $HOME).
+projects_root = "/Users/you/Projects"
+
+# Pin the project list instead of discovering it. When present, this is used
+# verbatim and projects_root is ignored. Omit the whole block to use discovery.
+# [[projects]]
+# name = "thought-engine"
+# path = "/Users/you/Projects/thought-engine"
+#
+# [[projects]]
+# name = "aetherspace"
+# path = "/Users/you/Projects/aetherspace"
+
+# Statusline health probes. Each is GET'd on the health cadence; a reachable
+# endpoint shows a green dot, an unreachable one magenta. Default: none.
+# (Consumed starting in a later phase; documented here for the full format.)
+[[probes]]
+name = "spark"
+url = "http://localhost:9292/health"
+
+# Poll cadences in seconds. The full git walk is decoupled from the lighter
+# system and health polls so a large repo does not churn a core every tick.
+[poll]
+sys_secs = 2     # CPU + memory refresh
+git_secs = 10    # branch + dirty-tree walk for the selected project
+health_secs = 2  # probe GETs
+
+# Embedded shell settings.
+[shell]
+scrollback = 10000  # lines of PTY scrollback retained

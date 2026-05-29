@@ -7,28 +7,19 @@
 //! drop logs rather than failing startup. Writes take a short mutex; the volume
 //! here (startup, panics, occasional warnings) makes contention a non-issue.
 
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+use crate::xdg;
 
-/// `$XDG_STATE_HOME` if set and non-empty, else `$HOME/.local/state`. Hand-rolled
-/// so we take no `dirs`-style dependency (which would resolve macOS paths wrong).
-fn state_home() -> PathBuf {
-    match env::var("XDG_STATE_HOME") {
-        Ok(x) if !x.is_empty() => PathBuf::from(x),
-        _ => PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/state"),
-    }
-}
+static LOG: OnceLock<Mutex<File>> = OnceLock::new();
 
 /// Open the log file for appending, creating the directory if needed. Best-effort:
 /// any failure leaves `LOG` unset and every `info/warn/error` becomes a no-op.
 pub fn init() {
-    let dir = state_home().join("aetherspace");
+    let dir = xdg::home("XDG_STATE_HOME", ".local/state").join("aetherspace");
     if fs::create_dir_all(&dir).is_err() {
         return;
     }

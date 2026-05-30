@@ -12,10 +12,9 @@ use std::thread;
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_term::vt100;
 
-use crate::Msg;
+use crate::event::RuntimeEvent;
 
 /// Bound on the PTY byte channel: backpressure so a flood (`cat bigfile`, `yes`)
 /// can't grow memory unbounded. The reader blocks once 64 chunks are unread; the
@@ -52,7 +51,12 @@ impl Shell {
     /// never reach the draw, stalling output and the quit check. The flag is
     /// cleared in `process_pending` before the byte channel is drained, so bytes
     /// arriving mid-drain re-arm a fresh wakeup.
-    pub fn spawn(rows: u16, cols: u16, scrollback: usize, notify: Sender<Msg>) -> Result<Self> {
+    pub fn spawn(
+        rows: u16,
+        cols: u16,
+        scrollback: usize,
+        notify: Sender<RuntimeEvent>,
+    ) -> Result<Self> {
         let (rows, cols) = (rows.max(1), cols.max(1));
         let pair = native_pty_system().openpty(PtySize {
             rows,
@@ -85,7 +89,7 @@ impl Shell {
                         // dead and wake the loop once so it reaps this leaf; without
                         // the wakeup an idle app would never notice the exit.
                         alive_reader.store(false, Ordering::Release);
-                        let _ = notify.send(Msg::Pty);
+                        let _ = notify.send(RuntimeEvent::ChildExit);
                         break;
                     }
                     Ok(n) => {
@@ -95,7 +99,7 @@ impl Shell {
                         // Edge-triggered wakeup: notify only when none is pending.
                         // Ignore send errors (gone receiver = shutting down).
                         if !pending.swap(true, Ordering::AcqRel) {
-                            let _ = notify.send(Msg::Pty);
+                            let _ = notify.send(RuntimeEvent::Pty);
                         }
                     }
                 }
@@ -173,18 +177,21 @@ impl Shell {
     /// rows actually stored. On the alternate screen vt100 pins scrollback at 0
     /// (screen.rs), so this is a no-op there — the caller uses that to tell a
     /// scrollable primary buffer from an alt-screen app.
+    #[allow(dead_code)]
     pub fn scroll_by(&mut self, delta: i64) {
         let target = scroll_delta(self.parser.screen().scrollback(), delta);
         self.parser.screen_mut().set_scrollback(target);
     }
 
     /// Snap the view back to the live bottom (scrollback offset 0).
+    #[allow(dead_code)]
     pub fn scroll_to_bottom(&mut self) {
         self.parser.screen_mut().set_scrollback(0);
     }
 
     /// Current scrollback offset in rows: 0 at the live bottom, higher further
     /// back. Drives the copy-mode position marker and the alt-screen detection.
+    #[allow(dead_code)]
     pub fn scrollback_offset(&self) -> usize {
         self.parser.screen().scrollback()
     }
@@ -194,89 +201,14 @@ impl Shell {
 /// history). Clamped at 0, the live bottom; the upper bound belongs to vt100 and
 /// is applied by `set_scrollback`. Pure, so the copy-mode scroll math is tested
 /// without a live PTY.
+#[allow(dead_code)]
 fn scroll_delta(current: usize, delta: i64) -> usize {
     (current as i64 + delta).max(0) as usize
-}
-
-/// Translate a crossterm key event into the byte sequence a PTY expects.
-/// Covers printable input, Ctrl-combos, and the common control/navigation keys.
-pub fn encode_key(key: KeyEvent) -> Vec<u8> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                // Ctrl-A..Ctrl-Z → 0x01..0x1a, etc.
-                vec![(c.to_ascii_uppercase() as u8).wrapping_sub(0x40) & 0x1f]
-            } else {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
-            }
-        }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        _ => vec![],
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-    fn ctrl(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn ctrl_letters_map_to_control_bytes() {
-        assert_eq!(encode_key(ctrl(KeyCode::Char('a'))), vec![0x01]);
-        assert_eq!(encode_key(ctrl(KeyCode::Char('z'))), vec![0x1a]);
-        // case-insensitive: Ctrl-C is 0x03 regardless of shift.
-        assert_eq!(encode_key(ctrl(KeyCode::Char('C'))), vec![0x03]);
-    }
-
-    #[test]
-    fn enter_and_backspace() {
-        assert_eq!(encode_key(key(KeyCode::Enter)), vec![b'\r']);
-        assert_eq!(encode_key(key(KeyCode::Backspace)), vec![0x7f]);
-    }
-
-    #[test]
-    fn arrows_emit_csi() {
-        assert_eq!(encode_key(key(KeyCode::Up)), b"\x1b[A".to_vec());
-        assert_eq!(encode_key(key(KeyCode::Down)), b"\x1b[B".to_vec());
-        assert_eq!(encode_key(key(KeyCode::Right)), b"\x1b[C".to_vec());
-        assert_eq!(encode_key(key(KeyCode::Left)), b"\x1b[D".to_vec());
-    }
-
-    #[test]
-    fn plain_char_is_its_byte() {
-        assert_eq!(encode_key(key(KeyCode::Char('a'))), vec![b'a']);
-    }
-
-    #[test]
-    fn multibyte_char_is_utf8() {
-        assert_eq!(encode_key(key(KeyCode::Char('é'))), "é".as_bytes().to_vec());
-    }
-
-    #[test]
-    fn unmapped_key_is_empty() {
-        assert!(encode_key(key(KeyCode::F(5))).is_empty());
-    }
 
     #[test]
     fn scroll_delta_moves_into_history() {

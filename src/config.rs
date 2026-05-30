@@ -98,6 +98,7 @@ impl Default for ShellCfg {
 /// A project the nav can show: a display name and its directory. Owned (not a
 /// `&'static str`) so it can come from discovery or a pinned config entry alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
@@ -136,6 +137,7 @@ impl Config {
 
     /// The nav project list: the pinned `projects` verbatim if configured, else
     /// discovery under `projects_root`.
+    #[allow(dead_code)]
     pub fn resolve_projects(&self) -> Vec<Project> {
         match &self.projects {
             Some(pinned) => pinned
@@ -154,6 +156,7 @@ impl Config {
 /// `.git` entry, sorted by `.git/HEAD` mtime descending (most recently active
 /// first) with a name tiebreak for determinism. An unreadable root yields an
 /// empty list, which the caller renders as an empty-state placeholder.
+#[allow(dead_code)]
 pub fn discover_projects(root: &Path) -> Vec<Project> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();

@@ -57,6 +57,7 @@ impl Theme {
 /// Pairs with `tui-markdown`'s `highlight-code` feature being off, so fenced code
 /// blocks also route through `code()` instead of syntect's themed backgrounds.
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub struct MarkdownTheme;
 
 impl tui_markdown::StyleSheet for MarkdownTheme {

@@ -29,7 +29,13 @@ use config::Project;
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::{
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+            KeyModifiers,
+        },
+        execute,
+    },
     layout::Direction,
     style::Style,
     text::{Line, Span, Text},
@@ -77,12 +83,16 @@ impl Pane {
 
 /// Input mode. `Normal` is the default; `Pane` is a one-shot prefix (entered with
 /// ctrl+w) whose next key is a pane command — split, close, focus, resize, zoom —
-/// after which it returns to `Normal`. The tmux-style prefix keeps the multiplexer
+/// after which it returns to `Normal`. `Resize` is a *sticky* sub-mode entered from
+/// Pane (via `r`, or by the first `<`/`>`): its keys resize the focused pane and
+/// stay, so a resize is one keystroke each instead of re-pressing the prefix, until
+/// `Esc`/`Enter` returns to `Normal`. The tmux-style prefix keeps the multiplexer
 /// verbs off the shell's keyspace without a full keymap abstraction.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Normal,
     Pane,
+    Resize,
 }
 
 /// Load a project's primary doc for the viewer: README.md, else CLAUDE.md,
@@ -232,6 +242,13 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Resize mode is sticky: each key resizes the focused pane and stays, so a
+        // resize is one keystroke per step. Esc/Enter (or ctrl+w) return to Normal.
+        if self.mode == Mode::Resize {
+            self.resize_command(key);
+            return;
+        }
+
         // Pane mode is a one-shot prefix: the next key is a pane command, then we
         // return to Normal whether or not it matched one (tmux-style).
         if self.mode == Mode::Pane {
@@ -331,9 +348,50 @@ impl App {
             KeyCode::Char('k') | KeyCode::Char('h') | KeyCode::Up | KeyCode::Left => {
                 self.workspace.focus_prev()
             }
-            KeyCode::Char('<') | KeyCode::Char(',') => self.workspace.nudge_focused(-RESIZE_STEP),
-            KeyCode::Char('>') | KeyCode::Char('.') => self.workspace.nudge_focused(RESIZE_STEP),
+            // r enters the sticky Resize sub-mode without moving anything yet.
+            KeyCode::Char('r') => self.mode = Mode::Resize,
+            // </> resize once, then drop into Resize so further presses repeat
+            // without re-pressing the ctrl+w prefix.
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                self.workspace.nudge_focused(-RESIZE_STEP);
+                self.mode = Mode::Resize;
+            }
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                self.workspace.nudge_focused(RESIZE_STEP);
+                self.mode = Mode::Resize;
+            }
             KeyCode::Char('z') => self.toggle_zoom(),
+            _ => {}
+        }
+    }
+
+    /// Execute a key in the sticky Resize sub-mode: nudge the focused pane and stay,
+    /// or return to Normal on Esc/Enter (or the ctrl+w prefix). `<`/`,`/`h`/`-` and
+    /// Left/Down shrink it; `>`/`.`/`l`/`+`/`=` and Right/Up grow it. RESIZE_STEP
+    /// percent per press. Stray keys are ignored (you stay in Resize until you exit).
+    fn resize_command(&mut self, key: KeyEvent) {
+        const RESIZE_STEP: i16 = 5;
+        if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Char('<')
+            | KeyCode::Char(',')
+            | KeyCode::Char('h')
+            | KeyCode::Char('-')
+            | KeyCode::Left
+            | KeyCode::Down
+            | KeyCode::Char('j') => self.workspace.nudge_focused(-RESIZE_STEP),
+            KeyCode::Char('>')
+            | KeyCode::Char('.')
+            | KeyCode::Char('l')
+            | KeyCode::Char('+')
+            | KeyCode::Char('=')
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Char('k') => self.workspace.nudge_focused(RESIZE_STEP),
             _ => {}
         }
     }
@@ -343,6 +401,29 @@ impl App {
     fn toggle_zoom(&mut self) {
         if self.workspace.toggle_zoom() {
             self.focus = Pane::Shell;
+        }
+    }
+
+    /// Route a mouse event to the workspace: left-drag a divider to resize, or
+    /// left-click a pane to focus it. Returns whether the frame should redraw. Other
+    /// buttons and motion are ignored (mouse-to-PTY forwarding is a later phase).
+    fn on_mouse(&mut self, m: event::MouseEvent) -> bool {
+        use event::{MouseButton, MouseEventKind};
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A divider grab wins; otherwise the click focuses the pane it hit.
+                if self.workspace.begin_drag(m.column, m.row)
+                    || self.workspace.focus_at(m.column, m.row)
+                {
+                    self.focus = Pane::Shell;
+                    true
+                } else {
+                    false
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.workspace.update_drag(m.column, m.row),
+            MouseEventKind::Up(MouseButton::Left) => self.workspace.end_drag(),
+            _ => false,
         }
     }
 }
@@ -447,6 +528,9 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error(&format!("panic: {info}"));
+        // Turn mouse reporting off before the terminal is restored, or a crash could
+        // leave the host terminal emitting mouse escape sequences on every move.
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
         original(info);
     }));
 }
@@ -492,8 +576,15 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     install_panic_hook();
+    // Enable mouse reporting so dividers can be dragged to resize and a click can
+    // focus the pane it lands on. Best-effort: a terminal that rejects it just loses
+    // mouse resize. Tradeoff: with capture on, the terminal's own click-to-select is
+    // suppressed — hold Option (Terminal.app/iTerm) for native selection. Turned off
+    // again before restore (and in the panic hook) so the host terminal is left clean.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     spawn_input_thread(tx);
     let result = run(&mut terminal, &mut app, rx);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     if let Err(e) = &result {
         log::error(&format!("exited with error: {e}"));
@@ -526,7 +617,8 @@ fn handle(app: &mut App, msg: Msg) -> bool {
             true
         }
         Msg::Input(Event::Resize(_, _)) => true,
-        Msg::Input(_) => false, // non-press key kinds; mouse/paste land in Phase 8
+        Msg::Input(Event::Mouse(m)) => app.on_mouse(m),
+        Msg::Input(_) => false, // non-press key kinds; paste lands in a later phase
         Msg::Pty => {
             app.workspace.process_pending();
             // A shell that hit EOF leaves a dead leaf; reap collapses it into its

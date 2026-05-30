@@ -35,7 +35,9 @@ pub struct Shell {
     alive: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
-    _child: Box<dyn Child + Send + Sync>, // kept alive so the shell process lives
+    // Owned so the shell process lives as long as the pane, and so closing a pane
+    // can kill it — dropping the handle alone does not (see `terminate`).
+    child: Box<dyn Child + Send + Sync>,
 }
 
 impl Shell {
@@ -109,7 +111,7 @@ impl Shell {
             alive,
             rows,
             cols,
-            _child: child,
+            child,
         })
     }
 
@@ -117,6 +119,16 @@ impl Shell {
     /// the event loop can collapse the dead leaf into its sibling.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Kill the shell's child process. Called when a pane is closed so the process
+    /// doesn't outlive its pane: dropping the `Shell` drops the child handle but does
+    /// not signal the process, and a still-running child keeps its PTY slave open, so
+    /// the reader thread never sees EOF on its own. Killing an already-exited child is
+    /// a harmless no-op. Once killed, the slave closes, the reader hits EOF, and the
+    /// reader thread winds itself down.
+    pub fn terminate(&mut self) {
+        let _ = self.child.kill();
     }
 
     /// Feed any bytes the shell has emitted since the last frame into the parser.

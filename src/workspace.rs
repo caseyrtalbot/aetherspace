@@ -50,6 +50,11 @@ pub struct Workspace {
     scrollback: usize,
     /// A clone of the event-loop sender, so a split's new shell can wake the loop.
     notify: Sender<Msg>,
+    /// The region the panes were last solved into. Stored at render so mouse events
+    /// (which carry absolute terminal coords and no `Frame`) can hit-test dividers.
+    last_area: Rect,
+    /// The separator currently being dragged with the mouse, if any.
+    drag: Option<layout::SepHit>,
 }
 
 impl Workspace {
@@ -67,6 +72,8 @@ impl Workspace {
             next_id: 1,
             scrollback,
             notify,
+            last_area: Rect::new(0, 0, 0, 0),
+            drag: None,
         }
     }
 
@@ -85,6 +92,9 @@ impl Workspace {
     /// holds app focus, so the focus highlight only shows when it does. When zoomed,
     /// only the focused leaf is drawn, filling the whole region.
     pub fn render(&mut self, f: &mut Frame, area: Rect, active: bool) {
+        // Remember the solved region so mouse hit-tests (no `Frame` at input time)
+        // can map an absolute cursor position to a divider or a pane.
+        self.last_area = area;
         if self.zoomed {
             self.render_leaf(f, self.focus, area, active);
             return;
@@ -245,7 +255,7 @@ impl Workspace {
     fn close_pane(&mut self, id: PaneId) -> bool {
         match layout::close_leaf(&mut self.tree, id) {
             CloseOutcome::Closed(survivor) => {
-                self.panes.remove(&id);
+                self.take_and_kill(id);
                 if self.focus == id {
                     self.copy_mode = false;
                     self.focus = survivor;
@@ -254,13 +264,27 @@ impl Workspace {
             CloseOutcome::WasLast => {
                 // The only pane: the tree keeps its Leaf(id), but the shell is gone,
                 // so the map empties and the caller quits the app.
-                self.panes.remove(&id);
+                self.take_and_kill(id);
             }
             CloseOutcome::NotFound => {
+                // The pane is in the map but not the tree — a desync that would make
+                // `reap_dead` loop forever re-collecting it. Evict it so the reaper
+                // makes progress; the loud assert flags the broken invariant.
+                debug_assert!(false, "close: {id:?} in pane map but absent from tree");
                 crate::log::error(&format!("close: {id:?} not found in tree"));
+                self.take_and_kill(id);
             }
         }
         !self.panes.is_empty()
+    }
+
+    /// Remove a pane from the collection and kill its child process, so closing a
+    /// pane never orphans a still-running shell. Killing an already-dead shell (the
+    /// `reap_dead` path) is a harmless no-op.
+    fn take_and_kill(&mut self, id: PaneId) {
+        if let Some(mut shell) = self.panes.remove(&id) {
+            shell.terminate();
+        }
     }
 
     /// Cycle focus to the next pane in layout order (wrapping).
@@ -292,6 +316,60 @@ impl Workspace {
     /// split's ratio; the clamp to `1..=99` lives in `layout::nudge_ratio`.
     pub fn nudge_focused(&mut self, delta: i16) {
         layout::nudge_ratio(&mut self.tree, self.focus, delta);
+    }
+
+    /// Begin a mouse resize: if `(x, y)` is on a carved divider, remember it as the
+    /// active drag. Returns whether a divider was grabbed. Zoom has no dividers.
+    pub fn begin_drag(&mut self, x: u16, y: u16) -> bool {
+        if self.zoomed {
+            return false;
+        }
+        self.drag = layout::sep_hit(&self.tree, self.last_area, x, y);
+        self.drag.is_some()
+    }
+
+    /// Continue the active drag: map the cursor to a 1..=99 ratio along the dragged
+    /// split's axis and retune it. Returns whether a drag was live (i.e. redraw).
+    pub fn update_drag(&mut self, x: u16, y: u16) -> bool {
+        let Some(hit) = &self.drag else {
+            return false;
+        };
+        // Position within the split's own area, projected onto its axis. The divider
+        // of a Horizontal split moves along x; a Vertical split's moves along y.
+        let (pos, len) = match hit.dir {
+            Direction::Horizontal => (x.saturating_sub(hit.area.x), hit.area.width),
+            Direction::Vertical => (y.saturating_sub(hit.area.y), hit.area.height),
+        };
+        if len == 0 {
+            return false;
+        }
+        let ratio = ((pos as u32 * 100) / len as u32) as u16;
+        layout::set_ratio_at(&mut self.tree, &hit.path, ratio);
+        true
+    }
+
+    /// End the active mouse drag. Returns whether one was in progress.
+    pub fn end_drag(&mut self) -> bool {
+        self.drag.take().is_some()
+    }
+
+    /// Focus the pane under `(x, y)` (click-to-focus). Returns whether a pane was hit
+    /// — the caller raises shell focus when so. Off every pane (the chrome gaps) it's
+    /// a no-op. Zoom shows only the focused leaf, so a hit there keeps it focused.
+    pub fn focus_at(&mut self, x: u16, y: u16) -> bool {
+        if self.zoomed {
+            return rect_contains(self.last_area, x, y);
+        }
+        for (id, rect) in solve(&self.tree, self.last_area) {
+            if rect_contains(rect, x, y) {
+                if id != self.focus {
+                    self.exit_copy_mode();
+                    self.focus = id;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Toggle tree-zoom on the focused pane; returns the new zoom state.
@@ -367,6 +445,12 @@ impl Workspace {
         }
         pty_send(shell, key);
     }
+}
+
+/// True if `(x, y)` falls inside `rect`. `right`/`bottom` saturate, so the test is
+/// overflow-safe at the u16 edge.
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
 /// Encode a key and write it to a shell's PTY (no-op for keys that don't map).

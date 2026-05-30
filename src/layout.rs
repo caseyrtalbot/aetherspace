@@ -192,6 +192,76 @@ pub fn nudge_ratio(node: &mut Node, target: PaneId, delta: i16) -> bool {
     nudge_ratio(a, target, delta) || nudge_ratio(b, target, delta)
 }
 
+/// A separator the pointer landed on: the path of `a`/`b` steps from the root to the
+/// owning `Split` (`false` = child `a`, `true` = child `b`), the split's direction,
+/// and the split's own area. `set_ratio_at` replays the path to retune that split,
+/// and `area` lets a drag map an absolute cursor position back to a 1..=99 ratio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SepHit {
+    pub path: Vec<bool>,
+    pub dir: Direction,
+    pub area: Rect,
+}
+
+/// True if `(x, y)` falls inside `r`. Local point-in-rect (ratatui's `contains` wants
+/// a `Position`); `right`/`bottom` saturate, so no overflow at the u16 edge.
+fn in_rect(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+}
+
+/// Find the split whose carved separator the point `(x, y)` lies on, descending the
+/// same geometry `solve` uses so the hit-test can never drift from what's drawn. A
+/// separator belongs to a split, not a child, so the parent separator is tested
+/// before recursing — a point on it can't also be inside either child rect. Returns
+/// `None` off every divider (or on a single leaf).
+pub fn sep_hit(node: &Node, area: Rect, x: u16, y: u16) -> Option<SepHit> {
+    let mut path = Vec::new();
+    sep_hit_into(node, area, x, y, &mut path)
+}
+
+fn sep_hit_into(node: &Node, area: Rect, x: u16, y: u16, path: &mut Vec<bool>) -> Option<SepHit> {
+    let Node::Split { dir, ratio, a, b } = node else {
+        return None;
+    };
+    let (ra, sep, rb) = split_rects(*dir, *ratio, area);
+    if in_rect(sep, x, y) {
+        return Some(SepHit {
+            path: path.clone(),
+            dir: *dir,
+            area,
+        });
+    }
+    if in_rect(ra, x, y) {
+        path.push(false);
+        let hit = sep_hit_into(a, ra, x, y, path);
+        path.pop();
+        return hit;
+    }
+    if in_rect(rb, x, y) {
+        path.push(true);
+        let hit = sep_hit_into(b, rb, x, y, path);
+        path.pop();
+        return hit;
+    }
+    None
+}
+
+/// Set the ratio of the split named by `path` (the `a`/`b` steps `sep_hit` recorded),
+/// clamped to `1..=99` so neither child collapses. A path that runs off a leaf is a
+/// no-op (the tree changed under a stale drag).
+pub fn set_ratio_at(node: &mut Node, path: &[bool], ratio: u16) {
+    let mut cur = node;
+    for &side in path {
+        let Node::Split { a, b, .. } = cur else {
+            return;
+        };
+        cur = if side { b } else { a };
+    }
+    if let Node::Split { ratio: r, .. } = cur {
+        *r = ratio.clamp(1, 99);
+    }
+}
+
 /// All leaf ids in layout order (in-order DFS: child `a` before child `b`) — the
 /// order focus cycles through with next/prev.
 pub fn leaves(node: &Node) -> Vec<PaneId> {
@@ -471,5 +541,81 @@ mod tests {
             100 * 30,
             "leaves plus separators tile the area exactly"
         );
+    }
+
+    #[test]
+    fn sep_hit_finds_the_root_divider_and_misses_off_it() {
+        // 80x40 vertical split at 50%: the carved separator is the single row that
+        // `solve` leaves between top and bottom. Hitting it returns the root split.
+        let area = Rect::new(0, 0, 80, 40);
+        let tree = two_leaf();
+        let sep = separators(&tree, area)[0].rect;
+        let hit = sep_hit(&tree, area, sep.x, sep.y).expect("on the divider");
+        assert_eq!(hit.path, Vec::<bool>::new(), "root split has an empty path");
+        assert_eq!(hit.dir, Direction::Vertical);
+        assert_eq!(hit.area, area);
+        // A point in the top pane (not on the divider) misses.
+        assert!(sep_hit(&tree, area, 10, 0).is_none());
+    }
+
+    #[test]
+    fn sep_hit_descends_to_a_nested_divider() {
+        // Outer horizontal split; its `b` child is a vertical split. A point on the
+        // inner divider resolves to path [true] (descend into b), not the root.
+        let area = Rect::new(0, 0, 100, 30);
+        let tree = Node::Split {
+            dir: Direction::Horizontal,
+            ratio: 40,
+            a: Box::new(Node::Leaf(PaneId(0))),
+            b: Box::new(Node::Split {
+                dir: Direction::Vertical,
+                ratio: 50,
+                a: Box::new(Node::Leaf(PaneId(1))),
+                b: Box::new(Node::Leaf(PaneId(2))),
+            }),
+        };
+        // The inner separator is the second track (root's is first).
+        let inner = separators(&tree, area)[1].rect;
+        let hit = sep_hit(&tree, area, inner.x, inner.y).expect("on the inner divider");
+        assert_eq!(hit.path, vec![true]);
+        assert_eq!(hit.dir, Direction::Vertical);
+    }
+
+    #[test]
+    fn set_ratio_at_retunes_the_named_split_and_clamps() {
+        let mut tree = Node::Split {
+            dir: Direction::Horizontal,
+            ratio: 40,
+            a: Box::new(Node::Leaf(PaneId(0))),
+            b: Box::new(Node::Split {
+                dir: Direction::Vertical,
+                ratio: 50,
+                a: Box::new(Node::Leaf(PaneId(1))),
+                b: Box::new(Node::Leaf(PaneId(2))),
+            }),
+        };
+        // Empty path retunes the root; path [true] retunes the nested split.
+        set_ratio_at(&mut tree, &[], 70);
+        set_ratio_at(&mut tree, &[true], 200); // clamps to 99
+        let Node::Split { ratio, b, .. } = &tree else {
+            panic!("expected split");
+        };
+        assert_eq!(*ratio, 70);
+        let Node::Split { ratio: inner, .. } = b.as_ref() else {
+            panic!("expected nested split");
+        };
+        assert_eq!(*inner, 99);
+    }
+
+    #[test]
+    fn set_ratio_at_is_a_noop_on_a_stale_path() {
+        // A path that runs off a leaf (tree shrank under a drag) changes nothing.
+        let mut tree = two_leaf();
+        set_ratio_at(&mut tree, &[false, true], 10);
+        if let Node::Split { ratio, .. } = tree {
+            assert_eq!(ratio, 50, "untouched");
+        } else {
+            panic!("expected split");
+        }
     }
 }

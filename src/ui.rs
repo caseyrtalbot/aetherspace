@@ -211,8 +211,10 @@ pub(crate) fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.status.snapshot();
     let dim = Style::default().fg(Theme::DIM);
     let sep = || Span::styled(" │ ", Style::default().fg(Theme::HAIR));
-    let hint = if app.mode == Mode::Pane {
-        "s/v:split  x:close  hjkl:move  <>:size  z:zoom"
+    let hint = if app.mode == Mode::Resize {
+        "resize: ↓←/<  shrink   ↑→/>  grow   esc: done"
+    } else if app.mode == Mode::Pane {
+        "s/v:split  x:close  hjkl:move  r:resize  z:zoom"
     } else if app.workspace.copy_mode() {
         "↑↓/pgup scroll   esc: live"
     } else if app.focus == Pane::Shell {

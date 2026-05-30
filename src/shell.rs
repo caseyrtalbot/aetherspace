@@ -30,6 +30,9 @@ pub struct Shell {
     // Edge-trigger for the wakeup: true while a Msg::Pty is outstanding. Lets a
     // byte flood coalesce to one wakeup instead of one per chunk (see spawn).
     pty_pending: Arc<AtomicBool>,
+    // Cleared by the reader thread on EOF (the child exited). The event loop reaps
+    // dead panes — see Workspace::reap_dead — collapsing the leaf into its sibling.
+    alive: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
     _child: Box<dyn Child + Send + Sync>, // kept alive so the shell process lives
@@ -69,11 +72,20 @@ impl Shell {
         let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_DEPTH);
         let pty_pending = Arc::new(AtomicBool::new(false));
         let pending = Arc::clone(&pty_pending);
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_reader = Arc::clone(&alive);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break, // EOF or read error → shell ended
+                    Ok(0) | Err(_) => {
+                        // EOF or read error → the shell process ended. Mark the pane
+                        // dead and wake the loop once so it reaps this leaf; without
+                        // the wakeup an idle app would never notice the exit.
+                        alive_reader.store(false, Ordering::Release);
+                        let _ = notify.send(Msg::Pty);
+                        break;
+                    }
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // receiver gone (app shutting down)
@@ -94,10 +106,17 @@ impl Shell {
             master,
             rx,
             pty_pending,
+            alive,
             rows,
             cols,
             _child: child,
         })
+    }
+
+    /// Whether the shell process is still running. False once its PTY hits EOF, so
+    /// the event loop can collapse the dead leaf into its sibling.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     /// Feed any bytes the shell has emitted since the last frame into the parser.

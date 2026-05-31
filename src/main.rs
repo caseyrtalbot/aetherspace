@@ -16,6 +16,7 @@ mod session;
 mod shell;
 mod terminal;
 mod theme;
+mod viewer;
 mod xdg;
 
 use anyhow::Result;

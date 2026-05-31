@@ -35,6 +35,8 @@ pub struct Config {
     pub shell: ShellCfg,
     /// Input settings: command leader and future keymap surface.
     pub input: InputCfg,
+    /// Workflow defaults for startup project and contextual viewer documents.
+    pub workflow: WorkflowCfg,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
             poll: PollCfg::default(),
             shell: ShellCfg::default(),
             input: InputCfg::default(),
+            workflow: WorkflowCfg::default(),
         }
     }
 }
@@ -55,6 +58,7 @@ impl Default for Config {
 pub struct ProjectEntry {
     pub name: String,
     pub path: PathBuf,
+    pub viewer: Option<PathBuf>,
 }
 
 /// A statusline health probe. Consumed in Phase 5.
@@ -114,13 +118,34 @@ impl Default for InputCfg {
     }
 }
 
+/// Workflow defaults that shape the initial command surface.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct WorkflowCfg {
+    /// Preferred project name to select on startup. If absent or unmatched, the
+    /// runtime chooses the current directory's project, then the first resolved
+    /// project.
+    pub startup_project: Option<String>,
+    /// Relative path opened by the viewer for projects that do not override it.
+    pub default_viewer: PathBuf,
+}
+
+impl Default for WorkflowCfg {
+    fn default() -> Self {
+        Self {
+            startup_project: None,
+            default_viewer: PathBuf::from("README.md"),
+        }
+    }
+}
+
 /// A project the nav can show: a display name and its directory. Owned (not a
 /// `&'static str`) so it can come from discovery or a pinned config entry alike.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
+    pub viewer: Option<PathBuf>,
 }
 
 /// `$HOME/Projects` — the default discovery root. Computed (not a literal `~`) so
@@ -164,6 +189,7 @@ impl Config {
                 .map(|e| Project {
                     name: e.name.clone(),
                     path: e.path.clone(),
+                    viewer: e.viewer.clone(),
                 })
                 .collect(),
             None => discover_projects(&self.projects_root),
@@ -194,7 +220,14 @@ pub fn discover_projects(root: &Path) -> Vec<Project> {
             let mtime = fs::metadata(path.join(".git/HEAD"))
                 .and_then(|m| m.modified())
                 .ok();
-            (Project { name, path }, mtime)
+            (
+                Project {
+                    name,
+                    path,
+                    viewer: None,
+                },
+                mtime,
+            )
         })
         .collect();
     // mtime descending (newest first), then name ascending as a stable tiebreak.
@@ -216,6 +249,7 @@ mod tests {
             [[projects]]
             name = "alpha"
             path = "/srv/code/alpha"
+            viewer = "docs/ops.md"
 
             [[probes]]
             name = "spark"
@@ -231,6 +265,10 @@ mod tests {
 
             [input]
             leader = "ctrl-g"
+
+            [workflow]
+            startup_project = "alpha"
+            default_viewer = "docs/README.md"
         "#;
         let cfg = Config::from_toml_or_default(toml);
         assert_eq!(cfg.projects_root, PathBuf::from("/srv/code"));
@@ -239,6 +277,7 @@ mod tests {
             Some(vec![ProjectEntry {
                 name: "alpha".into(),
                 path: PathBuf::from("/srv/code/alpha"),
+                viewer: Some(PathBuf::from("docs/ops.md")),
             }])
         );
         assert_eq!(
@@ -253,6 +292,8 @@ mod tests {
         assert_eq!(cfg.poll.health_secs, 3);
         assert_eq!(cfg.shell.scrollback, 50_000);
         assert_eq!(cfg.input.leader, "ctrl-g");
+        assert_eq!(cfg.workflow.startup_project.as_deref(), Some("alpha"));
+        assert_eq!(cfg.workflow.default_viewer, PathBuf::from("docs/README.md"));
     }
 
     #[test]
@@ -273,6 +314,7 @@ mod tests {
         assert_eq!(cfg.poll.health_secs, 2);
         assert_eq!(cfg.shell.scrollback, 10_000);
         assert_eq!(cfg.input, InputCfg::default());
+        assert_eq!(cfg.workflow, WorkflowCfg::default());
     }
 
     #[test]
@@ -333,10 +375,12 @@ mod tests {
                 ProjectEntry {
                     name: "one".into(),
                     path: PathBuf::from("/p/one"),
+                    viewer: None,
                 },
                 ProjectEntry {
                     name: "two".into(),
                     path: PathBuf::from("/p/two"),
+                    viewer: Some(PathBuf::from("docs/two.md")),
                 },
             ]),
             ..Config::default()
@@ -348,10 +392,12 @@ mod tests {
                 Project {
                     name: "one".into(),
                     path: PathBuf::from("/p/one"),
+                    viewer: None,
                 },
                 Project {
                     name: "two".into(),
                     path: PathBuf::from("/p/two"),
+                    viewer: Some(PathBuf::from("docs/two.md")),
                 },
             ]
         );

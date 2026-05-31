@@ -164,6 +164,10 @@ impl InputRouter {
         self.config.leader.label()
     }
 
+    pub(crate) fn is_leader_key(&self, key: KeyEvent) -> bool {
+        self.config.leader.matches(key)
+    }
+
     pub(crate) fn route_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::Noop;
@@ -211,17 +215,19 @@ impl InputRouter {
             | KeyCode::Down
             | KeyCode::Char('n')
             | KeyCode::Char('N') => Action::FocusNext,
-            KeyCode::BackTab
-            | KeyCode::Left
-            | KeyCode::Up
-            | KeyCode::Char('p')
-            | KeyCode::Char('P') => Action::FocusPrev,
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Action::FocusPrev,
             KeyCode::Char('>') | KeyCode::Char('=') | KeyCode::Char('+') => {
                 Action::ResizeFocusedPane { delta: 5 }
             }
             KeyCode::Char('<') | KeyCode::Char('_') => Action::ResizeFocusedPane { delta: -5 },
             KeyCode::Char('z') | KeyCode::Char('Z') => Action::ToggleZoomFocusedPane,
             KeyCode::Char('f') | KeyCode::Char('F') => Action::ToggleFloatFocusedPane,
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char(':') => {
+                Action::OpenCommandPalette
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => Action::OpenProjectPalette,
+            KeyCode::Char('v') | KeyCode::Char('V') => Action::OpenProjectViewer,
+            KeyCode::Char('s') | KeyCode::Char('S') => Action::OpenProjectShell,
             KeyCode::Esc => Action::Render,
             _ if self.config.leader.matches(key) => Action::SendBytes(self.config.leader.bytes()),
             _ => Action::Render,
@@ -517,6 +523,34 @@ mod tests {
         assert_eq!(
             router.route_key(key(KeyCode::Char('f'))),
             Action::ToggleFloatFocusedPane
+        );
+    }
+
+    #[test]
+    fn leader_routes_phase5_workflow_actions() {
+        let mut router = InputRouter::new(InputConfig::default());
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('c'))),
+            Action::OpenCommandPalette
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('p'))),
+            Action::OpenProjectPalette
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('v'))),
+            Action::OpenProjectViewer
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('s'))),
+            Action::OpenProjectShell
         );
     }
 

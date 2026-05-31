@@ -16,6 +16,10 @@ pub(crate) enum Action {
     ResizeFocusedPane { delta: i16 },
     ToggleZoomFocusedPane,
     ToggleFloatFocusedPane,
+    OpenCommandPalette,
+    OpenProjectPalette,
+    OpenProjectViewer,
+    OpenProjectShell,
     Noop,
 }
 

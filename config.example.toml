@@ -20,10 +20,12 @@ projects_root = "/Users/you/Projects"
 # [[projects]]
 # name = "thought-engine"
 # path = "/Users/you/Projects/thought-engine"
+# viewer = "README.md"
 #
 # [[projects]]
 # name = "aetherspace"
 # path = "/Users/you/Projects/aetherspace"
+# viewer = "docs/working/GREENFIELD-TERMINAL-SPEC.md"
 
 # Statusline health probes. Each is GET'd on the health cadence; a reachable
 # endpoint shows a green dot, an unreachable one magenta. Default: none.
@@ -46,3 +48,8 @@ scrollback = 10000  # lines of PTY scrollback retained
 # Input settings.
 [input]
 leader = "ctrl-space"  # accepts ctrl-space, ctrl-@, ctrl-g, alt-g, esc
+
+# Workflow defaults.
+[workflow]
+startup_project = "aetherspace"  # optional; exact project name from the nav list
+default_viewer = "README.md"      # relative to the selected project unless absolute

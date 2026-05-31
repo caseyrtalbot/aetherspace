@@ -1,30 +1,32 @@
-//! Unified runtime loop for the Phase 4 terminal-correctness surface.
+//! Unified runtime loop for the Phase 5 workflow surface.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use ratatui::crossterm::event::{self, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    self, KeyCode, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::Style,
-    text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::action::Action;
-use crate::config::Config;
+use crate::config::{Config, Project};
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::input::{InputConfig, InputRouter};
 use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
-use crate::session::{PaneId, Session};
+use crate::session::{PaneId, PaneSpec, ProjectSelection, Session};
 use crate::terminal::TerminalGuard;
 use crate::theme::Theme;
 
@@ -36,13 +38,27 @@ const MAX_EVENTS_PER_TURN: usize = 256;
 pub(crate) fn run(config: Config) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let session = Session::single_shell(cwd);
+    let projects = config.resolve_projects();
+    let selected_project =
+        select_start_project(&projects, config.workflow.startup_project.as_deref(), &cwd);
+    let shell_cwd = selected_project
+        .and_then(|idx| projects.get(idx).map(|project| project.path.clone()))
+        .unwrap_or_else(|| cwd.clone());
+    let session = Session::single_shell_for_project(
+        shell_cwd,
+        selected_project
+            .and_then(|idx| projects.get(idx))
+            .map(project_selection),
+    );
     let scrollback = config.shell.scrollback;
     let mut app = RuntimeApp::new(
         session,
         InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
         scrollback,
         tx.clone(),
+        projects,
+        selected_project,
+        config.workflow.default_viewer,
     )?;
 
     let mut guard = TerminalGuard::enter();
@@ -66,6 +82,10 @@ struct RuntimeApp {
     session: Session,
     panes: BTreeMap<PaneId, PaneRuntime>,
     input: InputRouter,
+    projects: Vec<Project>,
+    selected_project: Option<usize>,
+    default_viewer: PathBuf,
+    palette: Option<Palette>,
     last_area: Rect,
     scrollback: usize,
     notify: Sender<RuntimeEvent>,
@@ -73,12 +93,101 @@ struct RuntimeApp {
     last_notice: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Palette {
+    kind: PaletteKind,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteKind {
+    Commands,
+    Projects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteCommand {
+    ProjectPicker,
+    OpenProjectViewer,
+    OpenProjectShell,
+    SplitHorizontal,
+    SplitVertical,
+    ToggleFloat,
+    ToggleZoom,
+    Restart,
+    Close,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandItem {
+    command: PaletteCommand,
+    label: &'static str,
+    detail: &'static str,
+}
+
+const COMMAND_ITEMS: &[CommandItem] = &[
+    CommandItem {
+        command: PaletteCommand::ProjectPicker,
+        label: "projects",
+        detail: "select project and open shell",
+    },
+    CommandItem {
+        command: PaletteCommand::OpenProjectViewer,
+        label: "viewer",
+        detail: "open selected project document",
+    },
+    CommandItem {
+        command: PaletteCommand::OpenProjectShell,
+        label: "project shell",
+        detail: "open shell at selected project",
+    },
+    CommandItem {
+        command: PaletteCommand::SplitHorizontal,
+        label: "split right",
+        detail: "split focused shell horizontally",
+    },
+    CommandItem {
+        command: PaletteCommand::SplitVertical,
+        label: "split down",
+        detail: "split focused shell vertically",
+    },
+    CommandItem {
+        command: PaletteCommand::ToggleFloat,
+        label: "float/dock",
+        detail: "toggle focused pane",
+    },
+    CommandItem {
+        command: PaletteCommand::ToggleZoom,
+        label: "zoom",
+        detail: "toggle focused tiled pane",
+    },
+    CommandItem {
+        command: PaletteCommand::Restart,
+        label: "reload/restart",
+        detail: "restart shell or reload viewer",
+    },
+    CommandItem {
+        command: PaletteCommand::Close,
+        label: "close pane",
+        detail: "close focused pane",
+    },
+    CommandItem {
+        command: PaletteCommand::Quit,
+        label: "quit",
+        detail: "restore terminal and exit",
+    },
+];
+
 impl RuntimeApp {
     fn new(
         session: Session,
         input: InputRouter,
         scrollback: usize,
         notify: Sender<RuntimeEvent>,
+        projects: Vec<Project>,
+        selected_project: Option<usize>,
+        default_viewer: PathBuf,
     ) -> Result<Self> {
         let mut panes = BTreeMap::new();
         for spec in session.pane_specs() {
@@ -91,6 +200,10 @@ impl RuntimeApp {
             session,
             panes,
             input,
+            projects,
+            selected_project,
+            default_viewer,
+            palette: None,
             last_area: Rect::default(),
             scrollback,
             notify,
@@ -120,25 +233,40 @@ impl RuntimeApp {
         self.panes.get_mut(&id)
     }
 
-    fn restart_focused(&mut self) -> Result<()> {
-        let Some(id) = self.session.focused() else {
-            bail!("no focused pane to restart");
-        };
-        let spec = ensure_spec_matches_runtime(id, self.session.spec(id))?.clone();
-        let Some(pane) = self.panes.get_mut(&id) else {
-            bail!("focused pane {id:?} has no runtime");
-        };
-        pane.restart(&spec, self.scrollback, self.notify.clone())
+    fn selected_project(&self) -> Option<&Project> {
+        self.selected_project.and_then(|idx| self.projects.get(idx))
     }
 
-    fn split_focused(&mut self, dir: SplitDir) -> Result<()> {
-        let cwd = self
-            .session
-            .focused_shell_cwd()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let Some(spec) = self.session.split_focused_shell(cwd, dir) else {
-            bail!("focused pane cannot be split");
+    fn select_project(&mut self, index: usize) -> Result<()> {
+        let Some(project) = self.projects.get(index).cloned() else {
+            bail!("project index {index} is not available");
         };
+        self.selected_project = Some(index);
+        self.session.select_project(project_selection(&project));
+        self.last_notice = Some(format!("project selected: {}", project.name));
+        self.last_error = None;
+        Ok(())
+    }
+
+    fn focused_is_viewer(&self) -> bool {
+        self.session
+            .focused()
+            .and_then(|id| self.panes.get(&id))
+            .map(PaneRuntime::is_viewer)
+            .unwrap_or(false)
+    }
+
+    fn focused_content_height(&self) -> u16 {
+        let Some(id) = self.session.focused() else {
+            return INITIAL_ROWS;
+        };
+        pane_content_rects(&self.session, self.last_area)
+            .get(&id)
+            .map(|rect| rect.height)
+            .unwrap_or(INITIAL_ROWS)
+    }
+
+    fn spawn_runtime_for_spec(&mut self, spec: PaneSpec) -> Result<()> {
         let content_rects = pane_content_rects(&self.session, self.last_area);
         let content = content_rects.get(&spec.id).copied().unwrap_or(Rect::new(
             0,
@@ -163,6 +291,77 @@ impl RuntimeApp {
                 Err(e)
             }
         }
+    }
+
+    fn open_shell_for_selected_project(&mut self) -> Result<()> {
+        let Some(project) = self.selected_project().cloned() else {
+            bail!("no selected project");
+        };
+        let spec = self
+            .session
+            .open_shell(project.path, format!("SHELL · {}", project.name));
+        self.spawn_runtime_for_spec(spec)
+    }
+
+    fn open_viewer_for_selected_project(&mut self) -> Result<()> {
+        let Some(project) = self.selected_project().cloned() else {
+            bail!("no selected project");
+        };
+        let path = resolve_viewer_path(&project, &self.default_viewer);
+        let spec = self
+            .session
+            .open_viewer(path, format!("VIEWER · {}", project.name));
+        self.spawn_runtime_for_spec(spec)
+    }
+
+    fn open_project(&mut self, index: usize) -> Result<()> {
+        self.select_project(index)?;
+        self.open_shell_for_selected_project()
+    }
+
+    fn open_command_palette(&mut self) {
+        self.palette = Some(Palette {
+            kind: PaletteKind::Commands,
+            selected: 0,
+        });
+    }
+
+    fn open_project_palette(&mut self) {
+        if self.projects.is_empty() {
+            self.last_error = Some("no projects configured or discovered".to_string());
+            self.palette = None;
+            return;
+        }
+        self.palette = Some(Palette {
+            kind: PaletteKind::Projects,
+            selected: self
+                .selected_project
+                .unwrap_or(0)
+                .min(self.projects.len() - 1),
+        });
+    }
+
+    fn restart_focused(&mut self) -> Result<()> {
+        let Some(id) = self.session.focused() else {
+            bail!("no focused pane to restart");
+        };
+        let spec = ensure_spec_matches_runtime(id, self.session.spec(id))?.clone();
+        let Some(pane) = self.panes.get_mut(&id) else {
+            bail!("focused pane {id:?} has no runtime");
+        };
+        pane.restart(&spec, self.scrollback, self.notify.clone())
+    }
+
+    fn split_focused(&mut self, dir: SplitDir) -> Result<()> {
+        let cwd = self
+            .session
+            .focused_shell_cwd()
+            .or_else(|| self.selected_project().map(|project| project.path.clone()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let Some(spec) = self.session.split_focused_shell(cwd, dir) else {
+            bail!("focused pane cannot be split");
+        };
+        self.spawn_runtime_for_spec(spec)
     }
 
     fn close_focused(&mut self) {
@@ -230,6 +429,141 @@ impl RuntimeApp {
         self.last_notice = Some("mouse policy: child forwarding off".to_string());
         true
     }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if key.kind == KeyEventKind::Release {
+            return Some(false);
+        }
+        self.palette?;
+        match key.code {
+            KeyCode::Esc => {
+                self.palette = None;
+                Some(true)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_palette(-1);
+                Some(true)
+            }
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                self.move_palette(1);
+                Some(true)
+            }
+            KeyCode::BackTab => {
+                self.move_palette(-1);
+                Some(true)
+            }
+            KeyCode::Enter => Some(self.accept_palette()),
+            _ => Some(false),
+        }
+    }
+
+    fn move_palette(&mut self, delta: isize) {
+        let Some(palette) = self.palette else {
+            return;
+        };
+        let len = self.palette_len(palette.kind);
+        if len == 0 {
+            return;
+        }
+        let current = palette.selected.min(len - 1);
+        let next = (current as isize + delta).rem_euclid(len as isize) as usize;
+        self.palette = Some(Palette {
+            selected: next,
+            ..palette
+        });
+    }
+
+    fn palette_len(&self, kind: PaletteKind) -> usize {
+        match kind {
+            PaletteKind::Commands => COMMAND_ITEMS.len(),
+            PaletteKind::Projects => self.projects.len(),
+        }
+    }
+
+    fn accept_palette(&mut self) -> bool {
+        let Some(palette) = self.palette.take() else {
+            return false;
+        };
+        match palette.kind {
+            PaletteKind::Commands => {
+                let Some(item) = COMMAND_ITEMS.get(palette.selected) else {
+                    return true;
+                };
+                self.run_palette_command(item.command)
+            }
+            PaletteKind::Projects => {
+                if let Err(e) = self.open_project(palette.selected) {
+                    self.last_error = Some(format!("project open failed: {e}"));
+                }
+                true
+            }
+        }
+    }
+
+    fn run_palette_command(&mut self, command: PaletteCommand) -> bool {
+        match command {
+            PaletteCommand::ProjectPicker => {
+                self.open_project_palette();
+                true
+            }
+            PaletteCommand::OpenProjectViewer => {
+                if let Err(e) = self.open_viewer_for_selected_project() {
+                    self.last_error = Some(format!("viewer failed: {e}"));
+                } else {
+                    self.last_error = None;
+                }
+                true
+            }
+            PaletteCommand::OpenProjectShell => {
+                if let Err(e) = self.open_shell_for_selected_project() {
+                    self.last_error = Some(format!("project shell failed: {e}"));
+                } else {
+                    self.last_error = None;
+                }
+                true
+            }
+            PaletteCommand::SplitHorizontal => apply_action(
+                self,
+                Action::SplitFocusedPane {
+                    dir: SplitDir::Horizontal,
+                },
+            ),
+            PaletteCommand::SplitVertical => apply_action(
+                self,
+                Action::SplitFocusedPane {
+                    dir: SplitDir::Vertical,
+                },
+            ),
+            PaletteCommand::ToggleFloat => apply_action(self, Action::ToggleFloatFocusedPane),
+            PaletteCommand::ToggleZoom => apply_action(self, Action::ToggleZoomFocusedPane),
+            PaletteCommand::Restart => apply_action(self, Action::RestartFocusedPane),
+            PaletteCommand::Close => apply_action(self, Action::CloseFocusedPane),
+            PaletteCommand::Quit => apply_action(self, Action::Quit),
+        }
+    }
+
+    fn handle_viewer_key(&mut self, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        let rows = self.focused_content_height();
+        let Some(pane) = self.focused_pane_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => pane.scroll_viewer_by(1, rows),
+            KeyCode::Up | KeyCode::Char('k') => pane.scroll_viewer_by(-1, rows),
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                pane.scroll_viewer_by(rows.saturating_sub(1).max(1) as isize, rows)
+            }
+            KeyCode::PageUp => {
+                pane.scroll_viewer_by(-(rows.saturating_sub(1).max(1) as isize), rows)
+            }
+            KeyCode::Home => pane.scroll_viewer_home(),
+            KeyCode::End => pane.scroll_viewer_end(rows),
+            _ => false,
+        }
+    }
 }
 
 fn spawn_input_thread(tx: Sender<RuntimeEvent>) {
@@ -287,10 +621,7 @@ where
 
 fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
     match event {
-        RuntimeEvent::Key(key) => {
-            let action = app.input.route_key(key);
-            apply_action(app, action)
-        }
+        RuntimeEvent::Key(key) => handle_key(app, key),
         RuntimeEvent::Paste(text) => {
             let action = app.input.route_paste(text);
             apply_action(app, action)
@@ -312,6 +643,17 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
         }
         RuntimeEvent::Status | RuntimeEvent::Tick => true,
     }
+}
+
+fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
+    if let Some(dirty) = app.handle_palette_key(key) {
+        return dirty;
+    }
+    if app.focused_is_viewer() && !app.input.is_leader_key(key) && app.handle_viewer_key(key) {
+        return true;
+    }
+    let action = app.input.route_key(key);
+    apply_action(app, action)
 }
 
 fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
@@ -373,6 +715,30 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             app.toggle_float_focused();
             true
         }
+        Action::OpenCommandPalette => {
+            app.open_command_palette();
+            true
+        }
+        Action::OpenProjectPalette => {
+            app.open_project_palette();
+            true
+        }
+        Action::OpenProjectViewer => {
+            if let Err(e) = app.open_viewer_for_selected_project() {
+                app.last_error = Some(format!("viewer failed: {e}"));
+            } else {
+                app.last_error = None;
+            }
+            true
+        }
+        Action::OpenProjectShell => {
+            if let Err(e) = app.open_shell_for_selected_project() {
+                app.last_error = Some(format!("project shell failed: {e}"));
+            } else {
+                app.last_error = None;
+            }
+            true
+        }
         Action::Noop => dirty,
     }
 }
@@ -412,26 +778,44 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
         }
     }
 
+    if app.palette.is_some() {
+        draw_palette(frame, app, workspace);
+    }
+
     let hint = if let Some(error) = &app.last_error {
         error.as_str()
     } else if let Some(notice) = &app.last_notice {
         notice.as_str()
+    } else if app.palette.is_some() {
+        "enter run  up/down select  esc close"
+    } else if app.focused_is_viewer() {
+        "viewer  j/k scroll  pgup/pgdn page  leader commands"
     } else if app.input.mode_label() == "leader" {
-        "|/- split  tab focus  </> size  z zoom  f float  r restart  x close  q quit"
+        "c palette  p projects  v viewer  s shell  |/- split  q quit"
     } else {
-        "shell capture  mouse no-forward"
+        "shell capture  leader opens workflow"
     };
     let leader = app.input.leader_label();
+    let project = app
+        .session
+        .selected_project()
+        .map(|project| project.name.as_str())
+        .unwrap_or("no project");
     let status_line = Line::from(vec![
         Span::styled(" Aetherspace ", Style::default().fg(Theme::FG)),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
         Span::styled(
-            " phase 4 terminal correctness ",
+            format!(" phase 5 workflow · {project} "),
             Style::default().fg(Theme::DIM),
         ),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
         Span::styled(
-            format!(" {}:{} ", leader, app.input.mode_label()),
+            format!(" panes:{} ", app.panes.len()),
+            Style::default().fg(Theme::DIM),
+        ),
+        Span::styled("│", Style::default().fg(Theme::HAIR)),
+        Span::styled(
+            format!(" {leader}:{} ", app.input.mode_label()),
             Style::default().fg(Theme::DIM),
         ),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
@@ -462,9 +846,13 @@ fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floati
         Theme::label()
     };
     let prefix = if floating { " FLOAT " } else { " " };
+    let mut title = pane.title(spec);
+    if let Some(status) = pane.viewer_status() {
+        title = format!("{title}  {status}");
+    }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("{prefix}{}", pane.title(spec)),
+            format!("{prefix}{title}"),
             label_style,
         ))),
         label_rect(area),
@@ -472,10 +860,105 @@ fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floati
 
     let content = pane_content_rect(area);
     if content.width > 0 && content.height > 0 {
-        let term = PseudoTerminal::new(pane.shell_screen())
-            .cursor(Cursor::default().visibility(focused && pane.is_running()));
-        frame.render_widget(term, content);
+        if let Some(screen) = pane.shell_screen() {
+            let term = PseudoTerminal::new(screen)
+                .cursor(Cursor::default().visibility(focused && pane.is_running()));
+            frame.render_widget(term, content);
+        } else if let Some(lines) = pane.viewer_lines(content.height) {
+            frame.render_widget(Paragraph::new(Text::from(lines)), content);
+        }
     }
+}
+
+fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
+    let Some(palette) = app.palette else {
+        return;
+    };
+    let len = app.palette_len(palette.kind);
+    let desired_height = match palette.kind {
+        PaletteKind::Commands => (COMMAND_ITEMS.len() + 2) as u16,
+        PaletteKind::Projects => (app.projects.len().min(12) + 2) as u16,
+    };
+    let rect = overlay_rect(workspace, 78, desired_height.max(5));
+    if rect.width < 8 || rect.height < 3 {
+        return;
+    }
+
+    frame.render_widget(Clear, rect);
+    let title = match palette.kind {
+        PaletteKind::Commands => " command palette ",
+        PaletteKind::Projects => " projects ",
+    };
+    let block = Block::default()
+        .title(Line::from(Span::styled(title, Theme::label_focused())))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::HAIR));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let lines = if len == 0 {
+        vec![Line::from(Span::styled(
+            " no entries",
+            Style::default().fg(Theme::DIM),
+        ))]
+    } else {
+        palette_lines(app, palette, inner.height)
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn palette_lines(app: &RuntimeApp, palette: Palette, height: u16) -> Vec<Line<'static>> {
+    let len = app.palette_len(palette.kind);
+    let rows = height.max(1) as usize;
+    let selected = palette.selected.min(len.saturating_sub(1));
+    let start = selected.saturating_sub(rows.saturating_sub(1));
+    let end = len.min(start + rows);
+    (start..end)
+        .map(|idx| match palette.kind {
+            PaletteKind::Commands => {
+                let item = COMMAND_ITEMS[idx];
+                palette_line(idx == selected, item.label, item.detail)
+            }
+            PaletteKind::Projects => {
+                let project = &app.projects[idx];
+                palette_line(
+                    idx == selected,
+                    project.name.as_str(),
+                    &project.path.display().to_string(),
+                )
+            }
+        })
+        .collect()
+}
+
+fn palette_line(selected: bool, label: &str, detail: &str) -> Line<'static> {
+    let label_style = if selected {
+        Theme::label_focused()
+    } else {
+        Style::default().fg(Theme::FG)
+    };
+    Line::from(vec![
+        Span::styled(
+            if selected { "> " } else { "  " },
+            Style::default().fg(Theme::ACCENT),
+        ),
+        Span::styled(label.to_string(), label_style),
+        Span::styled(format!("  {detail}"), Style::default().fg(Theme::DIM)),
+    ])
+}
+
+fn overlay_rect(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = desired_width.min(area.width.saturating_sub(2).max(1));
+    let height = desired_height.min(area.height.saturating_sub(2).max(1));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn draw_separator(frame: &mut Frame, sep: layout::SepLine) {
@@ -546,6 +1029,37 @@ fn status_rect(area: Rect) -> Rect {
         .split(area)[1]
 }
 
+fn select_start_project(
+    projects: &[Project],
+    startup_project: Option<&str>,
+    cwd: &Path,
+) -> Option<usize> {
+    startup_project
+        .and_then(|name| projects.iter().position(|project| project.name == name))
+        .or_else(|| {
+            projects
+                .iter()
+                .position(|project| cwd.starts_with(&project.path))
+        })
+        .or_else(|| (!projects.is_empty()).then_some(0))
+}
+
+fn project_selection(project: &Project) -> ProjectSelection {
+    ProjectSelection {
+        name: project.name.clone(),
+        path: project.path.clone(),
+    }
+}
+
+fn resolve_viewer_path(project: &Project, default_viewer: &Path) -> PathBuf {
+    let viewer = project.viewer.as_deref().unwrap_or(default_viewer);
+    if viewer.is_absolute() {
+        viewer.to_path_buf()
+    } else {
+        project.path.join(viewer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +1084,60 @@ mod tests {
         let content = pane_content_rect(area);
         assert_eq!(content.height, 0);
         assert_eq!(content.width, 12);
+    }
+
+    #[test]
+    fn startup_project_prefers_config_then_cwd_then_first() {
+        let projects = vec![
+            Project {
+                name: "one".into(),
+                path: PathBuf::from("/work/one"),
+                viewer: None,
+            },
+            Project {
+                name: "two".into(),
+                path: PathBuf::from("/work/two"),
+                viewer: None,
+            },
+        ];
+        assert_eq!(
+            select_start_project(&projects, Some("two"), Path::new("/nowhere")),
+            Some(1)
+        );
+        assert_eq!(
+            select_start_project(&projects, Some("missing"), Path::new("/work/two/src")),
+            Some(1)
+        );
+        assert_eq!(
+            select_start_project(&projects, None, Path::new("/elsewhere")),
+            Some(0)
+        );
+        assert_eq!(
+            select_start_project(&[], None, Path::new("/elsewhere")),
+            None
+        );
+    }
+
+    #[test]
+    fn viewer_path_uses_project_override_or_default_relative_to_project() {
+        let project = Project {
+            name: "one".into(),
+            path: PathBuf::from("/work/one"),
+            viewer: None,
+        };
+        assert_eq!(
+            resolve_viewer_path(&project, Path::new("README.md")),
+            PathBuf::from("/work/one/README.md")
+        );
+
+        let project = Project {
+            name: "one".into(),
+            path: PathBuf::from("/work/one"),
+            viewer: Some(PathBuf::from("docs/start.md")),
+        };
+        assert_eq!(
+            resolve_viewer_path(&project, Path::new("README.md")),
+            PathBuf::from("/work/one/docs/start.md")
+        );
     }
 }

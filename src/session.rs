@@ -24,10 +24,19 @@ pub(crate) struct Session {
     tiled: Option<TileNode>,
     floating: std::collections::BTreeMap<PaneId, FloatGeom>,
     zoomed: Option<PaneId>,
+    selected_project: Option<ProjectSelection>,
 }
 
 impl Session {
+    #[cfg(test)]
     pub(crate) fn single_shell(cwd: PathBuf) -> Self {
+        Self::single_shell_for_project(cwd, None)
+    }
+
+    pub(crate) fn single_shell_for_project(
+        cwd: PathBuf,
+        selected_project: Option<ProjectSelection>,
+    ) -> Self {
         let id = PaneId(0);
         Self {
             panes: vec![PaneSpec::shell(id, cwd)],
@@ -36,6 +45,7 @@ impl Session {
             tiled: Some(TileNode::Leaf(id)),
             floating: std::collections::BTreeMap::new(),
             zoomed: None,
+            selected_project,
         }
     }
 
@@ -55,7 +65,16 @@ impl Session {
         let spec = self.focused_spec()?;
         match &spec.kind {
             PaneKind::Shell(shell) => Some(shell.cwd.clone()),
+            PaneKind::Viewer(_) => None,
         }
+    }
+
+    pub(crate) fn selected_project(&self) -> Option<&ProjectSelection> {
+        self.selected_project.as_ref()
+    }
+
+    pub(crate) fn select_project(&mut self, project: ProjectSelection) {
+        self.selected_project = Some(project);
     }
 
     pub(crate) fn spec(&self, id: PaneId) -> Option<&PaneSpec> {
@@ -187,13 +206,31 @@ impl Session {
 
     #[allow(dead_code)]
     pub(crate) fn allocate_shell(&mut self, cwd: PathBuf) -> PaneId {
+        self.open_shell(cwd, "SHELL".to_string()).id
+    }
+
+    pub(crate) fn open_shell(&mut self, cwd: PathBuf, title: String) -> PaneSpec {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
-        self.panes.push(PaneSpec::shell(id, cwd));
+        let spec = PaneSpec::shell_titled(id, cwd, title);
+        self.panes.push(spec.clone());
         self.focused = Some(id);
         let tree = self.tiled.take();
         self.tiled = Some(dock_leaf(tree, id, SplitDir::Horizontal));
-        id
+        self.zoomed = None;
+        spec
+    }
+
+    pub(crate) fn open_viewer(&mut self, path: PathBuf, title: String) -> PaneSpec {
+        let id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        let spec = PaneSpec::viewer(id, path, title);
+        self.panes.push(spec.clone());
+        self.focused = Some(id);
+        let tree = self.tiled.take();
+        self.tiled = Some(dock_leaf(tree, id, SplitDir::Horizontal));
+        self.zoomed = None;
+        spec
     }
 
     fn focus_by(&mut self, delta: isize) {
@@ -228,10 +265,22 @@ pub(crate) struct PaneSpec {
 
 impl PaneSpec {
     pub(crate) fn shell(id: PaneId, cwd: PathBuf) -> Self {
+        Self::shell_titled(id, cwd, "SHELL".to_string())
+    }
+
+    pub(crate) fn shell_titled(id: PaneId, cwd: PathBuf, title: String) -> Self {
         Self {
             id,
-            title: "SHELL".to_string(),
+            title,
             kind: PaneKind::Shell(ShellSpec { cwd }),
+        }
+    }
+
+    pub(crate) fn viewer(id: PaneId, path: PathBuf, title: String) -> Self {
+        Self {
+            id,
+            title,
+            kind: PaneKind::Viewer(ViewerSpec { path }),
         }
     }
 }
@@ -239,11 +288,23 @@ impl PaneSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PaneKind {
     Shell(ShellSpec),
+    Viewer(ViewerSpec),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ShellSpec {
     pub(crate) cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ViewerSpec {
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProjectSelection {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
 }
 
 #[cfg(test)]
@@ -259,6 +320,34 @@ mod tests {
         assert_eq!(session.next_pane_id, 1);
         assert_eq!(session.tiled(), Some(&TileNode::Leaf(PaneId(0))));
         assert!(session.floating().is_empty());
+        assert!(session.selected_project().is_none());
+    }
+
+    #[test]
+    fn selected_project_is_durable_session_context() {
+        let mut session = Session::single_shell_for_project(
+            PathBuf::from("/work/project"),
+            Some(ProjectSelection {
+                name: "project".into(),
+                path: PathBuf::from("/work/project"),
+            }),
+        );
+        assert_eq!(
+            session.selected_project(),
+            Some(&ProjectSelection {
+                name: "project".into(),
+                path: PathBuf::from("/work/project"),
+            })
+        );
+
+        session.select_project(ProjectSelection {
+            name: "other".into(),
+            path: PathBuf::from("/work/other"),
+        });
+        assert_eq!(
+            session.selected_project().map(|p| p.name.as_str()),
+            Some("other")
+        );
     }
 
     #[test]
@@ -299,6 +388,20 @@ mod tests {
             session.tiled().map(leaves),
             Some(vec![PaneId(0), PaneId(1)])
         );
+    }
+
+    #[test]
+    fn opening_viewer_docks_a_non_shell_pane() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        let spec = session.open_viewer(PathBuf::from("/work/one/README.md"), "VIEWER".into());
+        assert_eq!(spec.id, PaneId(1));
+        assert_eq!(session.focused(), Some(PaneId(1)));
+        assert_eq!(
+            session.tiled().map(leaves),
+            Some(vec![PaneId(0), PaneId(1)])
+        );
+        assert!(matches!(spec.kind, PaneKind::Viewer(_)));
+        assert_eq!(session.focused_shell_cwd(), None);
     }
 
     #[test]

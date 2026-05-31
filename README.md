@@ -56,23 +56,25 @@ Session layout is saved on clean exit to
 
 ## Controls
 
-The easiest controls are direct function keys:
+The startup guide opens automatically. Close it with `Esc` or `Enter` when you
+are ready to type.
+
+The easiest controls keep normal shell keys intact:
 
 | Key | Action |
 | --- | --- |
-| `F1` | Help |
-| `F2` | Command palette |
-| `F3` | Project picker |
-| `F4` | Open viewer for selected project |
-| `F5` | Open shell for selected project |
-| `F6` / `F7` | Focus next / previous pane |
-| `F8` | Zoom focused tiled pane |
-| `F9` | Close focused pane |
-| `F10` | Quit and restore terminal |
+| `Ctrl+Enter` or `Alt+Enter` | Command palette |
+| `Ctrl+/` or `Alt+/` | Help |
+| Click pane | Focus pane |
+| `Ctrl+Tab` | Focus next pane, if your terminal sends it |
+| `Shift+Tab` | Focus previous pane in viewer panes |
 
 Click a pane to focus it unless the focused child shell app has enabled mouse
 capture. The command palette also includes `reset workspace`, which collapses a
 cluttered restored session back to one selected-project shell.
+
+Function keys remain as a fallback: `F1` help, `F2` commands, `F3` projects,
+`F4` viewer, `F5` shell, `F6/F7` focus, `F8` zoom, `F9` close, and `F10` quit.
 
 Default leader: `Ctrl+Space`. The leader keys remain available when function
 keys are inconvenient.

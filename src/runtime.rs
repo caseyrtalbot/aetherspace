@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{
-    self, KeyCode, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
+    self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::{
     Frame, Terminal,
@@ -260,7 +260,7 @@ impl RuntimeApp {
             selected_project: init.selected_project,
             default_viewer: init.default_viewer,
             palette: None,
-            show_help: false,
+            show_help: true,
             last_area: Rect::default(),
             scrollback: init.scrollback,
             notify: init.notify,
@@ -865,7 +865,7 @@ fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     if app.show_help {
         return handle_help_key(app, key);
     }
-    if let Some(shortcut) = global_shortcut(key) {
+    if let Some(shortcut) = global_shortcut(app.focused_is_viewer(), key) {
         return match shortcut {
             GlobalShortcut::Help => {
                 app.open_help();
@@ -897,23 +897,59 @@ fn handle_help_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     }
 }
 
-fn global_shortcut(key: KeyEvent) -> Option<GlobalShortcut> {
-    if key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+fn global_shortcut(focused_is_viewer: bool, key: KeyEvent) -> Option<GlobalShortcut> {
+    if key.kind == KeyEventKind::Release {
         return None;
     }
-    match key.code {
-        KeyCode::F(1) => Some(GlobalShortcut::Help),
-        KeyCode::F(2) => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
-        KeyCode::F(3) => Some(GlobalShortcut::Action(Action::OpenProjectPalette)),
-        KeyCode::F(4) => Some(GlobalShortcut::Action(Action::OpenProjectViewer)),
-        KeyCode::F(5) => Some(GlobalShortcut::Action(Action::OpenProjectShell)),
-        KeyCode::F(6) => Some(GlobalShortcut::Action(Action::FocusNext)),
-        KeyCode::F(7) => Some(GlobalShortcut::Action(Action::FocusPrev)),
-        KeyCode::F(8) => Some(GlobalShortcut::Action(Action::ToggleZoomFocusedPane)),
-        KeyCode::F(9) => Some(GlobalShortcut::Action(Action::CloseFocusedPane)),
-        KeyCode::F(10) => Some(GlobalShortcut::Action(Action::Quit)),
-        _ => None,
+
+    if key.modifiers == KeyModifiers::NONE {
+        return match key.code {
+            KeyCode::F(1) => Some(GlobalShortcut::Help),
+            KeyCode::F(2) => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
+            KeyCode::F(3) => Some(GlobalShortcut::Action(Action::OpenProjectPalette)),
+            KeyCode::F(4) => Some(GlobalShortcut::Action(Action::OpenProjectViewer)),
+            KeyCode::F(5) => Some(GlobalShortcut::Action(Action::OpenProjectShell)),
+            KeyCode::F(6) => Some(GlobalShortcut::Action(Action::FocusNext)),
+            KeyCode::F(7) => Some(GlobalShortcut::Action(Action::FocusPrev)),
+            KeyCode::F(8) => Some(GlobalShortcut::Action(Action::ToggleZoomFocusedPane)),
+            KeyCode::F(9) => Some(GlobalShortcut::Action(Action::CloseFocusedPane)),
+            KeyCode::F(10) => Some(GlobalShortcut::Action(Action::Quit)),
+            KeyCode::Tab if focused_is_viewer => Some(GlobalShortcut::Action(Action::FocusNext)),
+            KeyCode::BackTab if focused_is_viewer => {
+                Some(GlobalShortcut::Action(Action::FocusPrev))
+            }
+            _ => None,
+        };
     }
+
+    if key.modifiers == KeyModifiers::CONTROL {
+        return match key.code {
+            KeyCode::Enter => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
+            KeyCode::Char('/') => Some(GlobalShortcut::Help),
+            KeyCode::Tab => Some(GlobalShortcut::Action(Action::FocusNext)),
+            KeyCode::BackTab => Some(GlobalShortcut::Action(Action::FocusPrev)),
+            _ => None,
+        };
+    }
+
+    if key.modifiers == KeyModifiers::ALT {
+        return match key.code {
+            KeyCode::Enter => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
+            KeyCode::Char('/') => Some(GlobalShortcut::Help),
+            KeyCode::Tab => Some(GlobalShortcut::Action(Action::FocusNext)),
+            KeyCode::BackTab => Some(GlobalShortcut::Action(Action::FocusPrev)),
+            _ => None,
+        };
+    }
+
+    if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+        return match key.code {
+            KeyCode::Tab | KeyCode::BackTab => Some(GlobalShortcut::Action(Action::FocusPrev)),
+            _ => None,
+        };
+    }
+
+    None
 }
 
 fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
@@ -1140,7 +1176,7 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, workspace: Rect) {
-    let rect = overlay_rect(workspace, 84, 17);
+    let rect = overlay_rect(workspace, 86, 17);
     if rect.width < 20 || rect.height < 8 {
         return;
     }
@@ -1154,21 +1190,20 @@ fn draw_help(frame: &mut Frame, workspace: Rect) {
     frame.render_widget(block, rect);
 
     let lines = vec![
-        help_line("F2", "commands", "open command palette"),
-        help_line("F3", "projects", "pick project and open shell"),
-        help_line("F4", "viewer", "open selected project README/viewer"),
-        help_line("F5", "shell", "open selected project shell"),
-        help_line("F6/F7", "focus", "move between panes"),
-        help_line("F8", "zoom", "toggle focused tiled pane"),
-        help_line("F9", "close", "close focused pane"),
-        help_line("F10", "quit", "save session and restore terminal"),
-        help_line("palette", "reset", "collapse clutter to one project shell"),
+        help_line("Ctrl+Enter", "commands", "open command palette"),
         help_line(
-            "click",
-            "focus",
-            "select pane unless child mouse capture is active",
+            "Alt+Enter",
+            "commands",
+            "fallback if Ctrl+Enter is not sent",
         ),
-        help_line("^Space", "leader", "legacy command prefix still works"),
+        help_line("Ctrl+/", "help", "open this guide"),
+        help_line("click", "focus", "select a pane"),
+        help_line("Ctrl+Tab", "focus", "next pane if your terminal sends it"),
+        help_line("Shift+Tab", "focus", "previous pane in viewer panes"),
+        help_line("palette", "project", "open project picker or a new shell"),
+        help_line("palette", "reset", "collapse clutter to one project shell"),
+        help_line("F keys", "fallback", "F1 help, F2 commands, F10 quit"),
+        help_line("^Space", "leader", "legacy command prefix"),
         help_line("Esc/Enter", "close", "close this help panel"),
     ];
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1327,7 +1362,7 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         (notice.as_str(), StatusTone::Notice)
     } else if app.show_help {
         (
-            "help  F2 commands  F6/F7 focus  F10 quit  esc close",
+            "startup guide  Ctrl+Enter commands  Ctrl+/ help  Esc close",
             StatusTone::Normal,
         )
     } else if matches!(
@@ -1345,7 +1380,7 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         ("enter run  up/down select  esc close", StatusTone::Normal)
     } else if app.focused_is_viewer() {
         (
-            "viewer  j/k scroll  F2 commands  F6 focus  F1 help",
+            "viewer  j/k scroll  Tab focus  Ctrl+Enter commands  Ctrl+/ help",
             StatusTone::Normal,
         )
     } else if app.input.mode_label() == "leader" {
@@ -1355,12 +1390,12 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         )
     } else if app.focused_child_mouse_enabled() {
         (
-            "shell capture  mouse->child  F2 commands  F1 help",
+            "shell capture  mouse->child  Ctrl+Enter commands  Ctrl+/ help",
             StatusTone::Normal,
         )
     } else {
         (
-            "F1 help  F2 commands  F6 focus  F10 quit  ^Space leader",
+            "click focus  Ctrl+Enter commands  Ctrl+/ help  ^Space leader",
             StatusTone::Normal,
         )
     }
@@ -1641,29 +1676,49 @@ mod tests {
     }
 
     #[test]
-    fn function_keys_route_global_shortcuts_without_stealing_question_mark() {
+    fn global_shortcuts_keep_shell_typing_safe() {
         use ratatui::crossterm::event::KeyModifiers;
 
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert_eq!(
-            global_shortcut(key(KeyCode::F(1))),
+            global_shortcut(false, key(KeyCode::F(1))),
             Some(GlobalShortcut::Help)
         );
         assert_eq!(
-            global_shortcut(key(KeyCode::F(2))),
+            global_shortcut(false, key(KeyCode::F(2))),
             Some(GlobalShortcut::Action(Action::OpenCommandPalette))
         );
         assert_eq!(
-            global_shortcut(key(KeyCode::F(6))),
+            global_shortcut(false, key(KeyCode::F(6))),
             Some(GlobalShortcut::Action(Action::FocusNext))
         );
         assert_eq!(
-            global_shortcut(key(KeyCode::F(10))),
+            global_shortcut(false, key(KeyCode::F(10))),
             Some(GlobalShortcut::Action(Action::Quit))
         );
-        assert_eq!(global_shortcut(key(KeyCode::Char('?'))), None);
         assert_eq!(
-            global_shortcut(KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT)),
+            global_shortcut(false, KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(GlobalShortcut::Action(Action::OpenCommandPalette))
+        );
+        assert_eq!(
+            global_shortcut(
+                false,
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)
+            ),
+            Some(GlobalShortcut::Help)
+        );
+        assert_eq!(
+            global_shortcut(false, KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            Some(GlobalShortcut::Action(Action::FocusNext))
+        );
+        assert_eq!(global_shortcut(false, key(KeyCode::Char('?'))), None);
+        assert_eq!(global_shortcut(false, key(KeyCode::Tab)), None);
+        assert_eq!(
+            global_shortcut(true, key(KeyCode::Tab)),
+            Some(GlobalShortcut::Action(Action::FocusNext))
+        );
+        assert_eq!(
+            global_shortcut(false, KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT)),
             None
         );
     }

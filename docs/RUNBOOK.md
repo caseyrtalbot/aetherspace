@@ -25,20 +25,21 @@ Run `target/debug/aetherspace` in a real terminal or a PTY harness.
 Expected path:
 
 1. The first shell pane renders and the statusline says `v0.1 tui`.
-2. After the first status poll, the statusline includes compact `sys` and `git`
+2. The startup guide is visible; `Esc` or `Enter` closes it.
+3. After the first status poll, the statusline includes compact `sys` and `git`
    status; configured probes appear as `health:ok/total`.
-3. `F1` opens help; `Esc` or `Enter` closes it.
-4. `F2` opens the command palette.
-5. The `status details` command opens current system, git, and probe rows.
-6. `Enter` or `Esc` closes the status details palette.
-7. `F4` opens a viewer pane for the selected project.
-8. `j` scrolls the focused viewer.
-9. `F6` and `F7` move focus between panes.
-10. Clicking another pane focuses it when child mouse capture is inactive.
-11. `F3` opens the project picker.
+4. `Ctrl+/` or `Alt+/` opens help again.
+5. `Ctrl+Enter` or `Alt+Enter` opens the command palette.
+6. The `status details` command opens current system, git, and probe rows.
+7. `Enter` or `Esc` closes the status details palette.
+8. The command palette can open a viewer pane for the selected project.
+9. `j` scrolls the focused viewer.
+10. `Ctrl+Tab` moves focus if the terminal sends it; clicking another pane
+   focuses it when child mouse capture is inactive.
+11. The command palette can open the project picker.
 12. `Enter` selects a project and opens a project shell.
-13. `F2` then `reset workspace` collapses a cluttered session to one shell.
-14. `F10` exits with status 0 and restores the terminal.
+13. `reset workspace` collapses a cluttered session to one shell.
+14. The command palette can quit; `F10` remains a fallback quit key.
 
 Legacy leader path:
 

@@ -1,7 +1,8 @@
-//! All visual identity lives here. Direction: Hairline Minimal Mono, retuned to
-//! jet-black + white with a single retro-orange accent; every *other* color that
-//! ever appears (status dots, syntax, signals) draws from the glowy-retro set
-//! below so the whole surface reads like warm phosphor on black.
+//! Visual identity for the terminal surface.
+//!
+//! Direction: hairline minimal mono, jet black plus white, with one retro-orange
+//! accent for focus and selection. Secondary signals use a small saturated set so
+//! status, viewer hierarchy, and notices stay legible without becoming a rainbow.
 //!
 //! Note: a terminal cell grid can't do real glow/bloom — "glowy" here means
 //! saturated brights on true black, not a blur effect. Font is the host
@@ -14,8 +15,6 @@ use ratatui::style::{Color, Modifier, Style};
 
 pub struct Theme;
 
-// Palette is defined ahead of use: SELECT_BG and the unused GLOW_* land in
-// Phase 2b/2c (selection fill, status dots, syntax). Intentional, not dead.
 #[allow(dead_code)]
 impl Theme {
     // --- Core: jet black + white ---
@@ -46,6 +45,33 @@ impl Theme {
     pub fn label_focused() -> Style {
         Style::default()
             .fg(Self::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn status_title() -> Style {
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn status_meta() -> Style {
+        Style::default().fg(Self::DIM)
+    }
+
+    pub fn status_notice() -> Style {
+        Style::default()
+            .fg(Self::GLOW_AMBER)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn status_error() -> Style {
+        Style::default()
+            .fg(Self::GLOW_MAGENTA)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn selected_row() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .bg(Self::SELECT_BG)
             .add_modifier(Modifier::BOLD)
     }
 }

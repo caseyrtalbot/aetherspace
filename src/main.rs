@@ -1,7 +1,7 @@
-//! Aetherspace Phase 1 boot path.
+//! Aetherspace boot path.
 //!
-//! The current app is intentionally small: one shell pane, a guarded terminal
-//! boundary, a unified runtime queue, and input routed through actions.
+//! `main` stays intentionally thin: initialize logging, load config, and hand
+//! control to the guarded Ratatui runtime.
 
 mod action;
 mod config;

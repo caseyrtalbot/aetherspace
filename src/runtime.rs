@@ -1,4 +1,4 @@
-//! Unified runtime loop for the Phase 5 workflow surface.
+//! Unified runtime loop for the Aetherspace TUI.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use tui_term::widget::{Cursor, PseudoTerminal};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::Action;
 use crate::config::{Config, Project};
@@ -117,6 +118,13 @@ enum PaletteCommand {
     Restart,
     Close,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTone {
+    Normal,
+    Notice,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -782,46 +790,7 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
         draw_palette(frame, app, workspace);
     }
 
-    let hint = if let Some(error) = &app.last_error {
-        error.as_str()
-    } else if let Some(notice) = &app.last_notice {
-        notice.as_str()
-    } else if app.palette.is_some() {
-        "enter run  up/down select  esc close"
-    } else if app.focused_is_viewer() {
-        "viewer  j/k scroll  pgup/pgdn page  leader commands"
-    } else if app.input.mode_label() == "leader" {
-        "c palette  p projects  v viewer  s shell  |/- split  q quit"
-    } else {
-        "shell capture  leader opens workflow"
-    };
-    let leader = app.input.leader_label();
-    let project = app
-        .session
-        .selected_project()
-        .map(|project| project.name.as_str())
-        .unwrap_or("no project");
-    let status_line = Line::from(vec![
-        Span::styled(" Aetherspace ", Style::default().fg(Theme::FG)),
-        Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(
-            format!(" phase 5 workflow · {project} "),
-            Style::default().fg(Theme::DIM),
-        ),
-        Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(
-            format!(" panes:{} ", app.panes.len()),
-            Style::default().fg(Theme::DIM),
-        ),
-        Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(
-            format!(" {leader}:{} ", app.input.mode_label()),
-            Style::default().fg(Theme::DIM),
-        ),
-        Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(format!(" {hint}"), Style::default().fg(Theme::DIM)),
-    ]);
-    frame.render_widget(Paragraph::new(status_line), status);
+    draw_statusline(frame, app, status);
 }
 
 fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floating: bool) {
@@ -902,12 +871,17 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
             Style::default().fg(Theme::DIM),
         ))]
     } else {
-        palette_lines(app, palette, inner.height)
+        palette_lines(app, palette, inner.height, inner.width)
     };
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn palette_lines(app: &RuntimeApp, palette: Palette, height: u16) -> Vec<Line<'static>> {
+fn palette_lines(
+    app: &RuntimeApp,
+    palette: Palette,
+    height: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
     let len = app.palette_len(palette.kind);
     let rows = height.max(1) as usize;
     let selected = palette.selected.min(len.saturating_sub(1));
@@ -917,7 +891,7 @@ fn palette_lines(app: &RuntimeApp, palette: Palette, height: u16) -> Vec<Line<'s
         .map(|idx| match palette.kind {
             PaletteKind::Commands => {
                 let item = COMMAND_ITEMS[idx];
-                palette_line(idx == selected, item.label, item.detail)
+                palette_line(idx == selected, item.label, item.detail, width)
             }
             PaletteKind::Projects => {
                 let project = &app.projects[idx];
@@ -925,26 +899,169 @@ fn palette_lines(app: &RuntimeApp, palette: Palette, height: u16) -> Vec<Line<'s
                     idx == selected,
                     project.name.as_str(),
                     &project.path.display().to_string(),
+                    width,
                 )
             }
         })
         .collect()
 }
 
-fn palette_line(selected: bool, label: &str, detail: &str) -> Line<'static> {
+fn palette_line(selected: bool, label: &str, detail: &str, width: u16) -> Line<'static> {
     let label_style = if selected {
-        Theme::label_focused()
+        Theme::selected_row()
     } else {
         Style::default().fg(Theme::FG)
     };
+    let detail_style = if selected {
+        Style::default().fg(Theme::FG).bg(Theme::SELECT_BG)
+    } else {
+        Style::default().fg(Theme::DIM)
+    };
+    if width <= 4 {
+        return Line::from(Span::styled(truncate_width(label, width), label_style));
+    }
+    let label_budget = width.saturating_sub(4).min(24);
+    let label = truncate_width(label, label_budget);
+    let detail_budget = width
+        .saturating_sub(UnicodeWidthStr::width(label.as_str()) as u16)
+        .saturating_sub(4);
+    let detail = truncate_width(detail, detail_budget);
     Line::from(vec![
         Span::styled(
             if selected { "> " } else { "  " },
-            Style::default().fg(Theme::ACCENT),
+            if selected {
+                Theme::selected_row()
+            } else {
+                Style::default().fg(Theme::ACCENT)
+            },
         ),
         Span::styled(label.to_string(), label_style),
-        Span::styled(format!("  {detail}"), Style::default().fg(Theme::DIM)),
+        Span::styled(format!("  {detail}"), detail_style),
     ])
+}
+
+fn draw_statusline(frame: &mut Frame, app: &RuntimeApp, area: Rect) {
+    let (message, tone) = status_message(app);
+    let project = app
+        .session
+        .selected_project()
+        .map(|project| project.name.as_str())
+        .unwrap_or("no project");
+    let project = truncate_width(project, status_project_budget(area.width));
+    let pane_state = pane_state(app);
+    let mode = if app.input.mode_label() == "leader" {
+        "leader"
+    } else {
+        "capture"
+    };
+    let leader = app.input.leader_label();
+
+    let sep = || Span::styled(" │ ", Style::default().fg(Theme::HAIR));
+    let mut spans = vec![
+        Span::styled(" Aetherspace ", Theme::status_title()),
+        sep(),
+        Span::styled("v0.1 tui ", Theme::status_meta()),
+        sep(),
+        Span::styled(format!("project:{project} "), Theme::status_meta()),
+        sep(),
+        Span::styled(format!("{pane_state} "), Theme::status_meta()),
+        sep(),
+        Span::styled(format!("{leader}:{mode} "), Theme::status_meta()),
+    ];
+
+    let used = spans_width(&spans);
+    let budget = area.width.saturating_sub(used).saturating_sub(3);
+    if budget > 0 {
+        let style = match tone {
+            StatusTone::Normal => Theme::status_meta(),
+            StatusTone::Notice => Theme::status_notice(),
+            StatusTone::Error => Theme::status_error(),
+        };
+        spans.push(sep());
+        spans.push(Span::styled(truncate_width(message, budget), style));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
+    if let Some(error) = &app.last_error {
+        (error.as_str(), StatusTone::Error)
+    } else if let Some(notice) = &app.last_notice {
+        (notice.as_str(), StatusTone::Notice)
+    } else if app.palette.is_some() {
+        ("enter run  up/down select  esc close", StatusTone::Normal)
+    } else if app.focused_is_viewer() {
+        (
+            "viewer  j/k scroll  pgup/pgdn page  leader commands",
+            StatusTone::Normal,
+        )
+    } else if app.input.mode_label() == "leader" {
+        (
+            "c palette  p projects  v viewer  s shell  |/- split  q quit",
+            StatusTone::Normal,
+        )
+    } else {
+        ("shell capture  leader opens workflow", StatusTone::Normal)
+    }
+}
+
+fn pane_state(app: &RuntimeApp) -> String {
+    let focus_kind = if app.focused_is_viewer() {
+        "viewer"
+    } else {
+        "shell"
+    };
+    let surface = if app.session.zoomed().is_some() {
+        "zoom"
+    } else if app
+        .session
+        .focused()
+        .map(|id| app.session.is_floating(id))
+        .unwrap_or(false)
+    {
+        "float"
+    } else {
+        "tile"
+    };
+    format!("panes:{} {surface}:{focus_kind}", app.panes.len())
+}
+
+fn status_project_budget(width: u16) -> u16 {
+    match width {
+        0..=79 => 14,
+        80..=119 => 24,
+        _ => 36,
+    }
+}
+
+fn spans_width(spans: &[Span<'_>]) -> u16 {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+        .sum()
+}
+
+fn truncate_width(s: &str, max: u16) -> String {
+    let max = max as usize;
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in s.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > budget {
+            break;
+        }
+        out.push(ch);
+        width += char_width;
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out
 }
 
 fn overlay_rect(area: Rect, desired_width: u16, desired_height: u16) -> Rect {

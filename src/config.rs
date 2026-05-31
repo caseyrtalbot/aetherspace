@@ -1,4 +1,4 @@
-//! XDG config loading and dynamic project discovery (Phase 3).
+//! XDG config loading and dynamic project discovery.
 //!
 //! Config lives at `$XDG_CONFIG_HOME/aetherspace/config.toml` (else
 //! `~/.config/aetherspace/config.toml`). Every field has a default, so a missing
@@ -25,11 +25,11 @@ pub struct Config {
     /// Pinned project list. When `Some`, it is used verbatim and discovery is
     /// skipped entirely.
     pub projects: Option<Vec<ProjectEntry>>,
-    /// Health probes shown in the statusline. Consumed in Phase 5.
-    #[allow(dead_code)] // wired into StatusMonitor in Phase 5
+    /// Health probes reserved for the status surface.
+    #[allow(dead_code)]
     pub probes: Vec<ProbeEntry>,
-    /// Per-task poll cadences. Consumed in Phase 5.
-    #[allow(dead_code)] // wired into the poll loop in Phase 5
+    /// Per-task poll cadences reserved for the status surface.
+    #[allow(dead_code)]
     pub poll: PollCfg,
     /// Shell settings (scrollback depth, wired into the PTY parser).
     pub shell: ShellCfg,
@@ -61,8 +61,8 @@ pub struct ProjectEntry {
     pub viewer: Option<PathBuf>,
 }
 
-/// A statusline health probe. Consumed in Phase 5.
-#[allow(dead_code)] // fields read once probes are wired in Phase 5
+/// A statusline health probe.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProbeEntry {
     pub name: String,
@@ -72,7 +72,7 @@ pub struct ProbeEntry {
 /// Poll cadences in seconds, decoupling the full git walk from the health probe.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
-#[allow(dead_code)] // fields read once cadences are wired in Phase 5
+#[allow(dead_code)]
 pub struct PollCfg {
     pub sys_secs: u64,
     pub git_secs: u64,

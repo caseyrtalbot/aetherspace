@@ -8,6 +8,19 @@ authors = ["Casey Talbot <caseyrtalbot@gmail.com>"]
 readme = "README.md"
 keywords = ["tui", "terminal", "ratatui", "command-center"]
 categories = ["command-line-utilities"]
+include = [
+    "src/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "config.example.toml",
+    "docs/RUNBOOK.md",
+]
+
+[[bin]]
+name = "aetherspace"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -28,3 +41,8 @@ ureq = { version = "3.3.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

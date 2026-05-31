@@ -1,20 +1,21 @@
 //! Intent-level actions emitted by the input router.
 
+use crate::layout::SplitDir;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Quit,
     Render,
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
+    Resize { cols: u16, rows: u16 },
     SendBytes(Vec<u8>),
+    SplitFocusedPane { dir: SplitDir },
     RestartFocusedPane,
     CloseFocusedPane,
-    #[allow(dead_code)]
     FocusNext,
-    #[allow(dead_code)]
     FocusPrev,
+    ResizeFocusedPane { delta: i16 },
+    ToggleZoomFocusedPane,
+    ToggleFloatFocusedPane,
     Noop,
 }
 

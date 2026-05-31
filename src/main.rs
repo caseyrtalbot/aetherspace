@@ -7,6 +7,7 @@ mod action;
 mod config;
 mod event;
 mod input;
+mod layout;
 mod log;
 mod pane;
 mod pty;

@@ -8,6 +8,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::layout::{
+    CloseOutcome, FloatGeom, SplitDir, TileNode, close_leaf, contains_leaf, dock_leaf, leaves,
+    nudge_ratio, split_leaf,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct PaneId(pub(crate) u64);
 
@@ -16,6 +21,9 @@ pub(crate) struct Session {
     panes: Vec<PaneSpec>,
     focused: Option<PaneId>,
     next_pane_id: u64,
+    tiled: Option<TileNode>,
+    floating: std::collections::BTreeMap<PaneId, FloatGeom>,
+    zoomed: Option<PaneId>,
 }
 
 impl Session {
@@ -25,6 +33,9 @@ impl Session {
             panes: vec![PaneSpec::shell(id, cwd)],
             focused: Some(id),
             next_pane_id: 1,
+            tiled: Some(TileNode::Leaf(id)),
+            floating: std::collections::BTreeMap::new(),
+            zoomed: None,
         }
     }
 
@@ -40,8 +51,114 @@ impl Session {
         self.focused.and_then(|id| self.spec(id))
     }
 
+    pub(crate) fn focused_shell_cwd(&self) -> Option<PathBuf> {
+        let spec = self.focused_spec()?;
+        match &spec.kind {
+            PaneKind::Shell(shell) => Some(shell.cwd.clone()),
+        }
+    }
+
     pub(crate) fn spec(&self, id: PaneId) -> Option<&PaneSpec> {
         self.panes.iter().find(|spec| spec.id == id)
+    }
+
+    pub(crate) fn tiled(&self) -> Option<&TileNode> {
+        self.tiled.as_ref()
+    }
+
+    pub(crate) fn floating(&self) -> &std::collections::BTreeMap<PaneId, FloatGeom> {
+        &self.floating
+    }
+
+    pub(crate) fn zoomed(&self) -> Option<PaneId> {
+        self.zoomed
+    }
+
+    pub(crate) fn is_floating(&self, id: PaneId) -> bool {
+        self.floating.contains_key(&id)
+    }
+
+    pub(crate) fn is_tiled(&self, id: PaneId) -> bool {
+        self.tiled
+            .as_ref()
+            .map(|tree| contains_leaf(tree, id))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn split_focused_shell(&mut self, cwd: PathBuf, dir: SplitDir) -> Option<PaneSpec> {
+        let target = self.focused?;
+        if self.is_floating(target) {
+            return None;
+        }
+        let tree = self.tiled.as_mut()?;
+        let id = PaneId(self.next_pane_id);
+        if !split_leaf(tree, target, id, dir) {
+            return None;
+        }
+        self.next_pane_id += 1;
+        let spec = PaneSpec::shell(id, cwd);
+        self.panes.push(spec.clone());
+        self.focused = Some(id);
+        self.zoomed = None;
+        Some(spec)
+    }
+
+    pub(crate) fn focus_next(&mut self) {
+        self.focus_by(1);
+    }
+
+    pub(crate) fn focus_prev(&mut self) {
+        self.focus_by(-1);
+    }
+
+    pub(crate) fn resize_focused(&mut self, delta: i16) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        let Some(tree) = self.tiled.as_mut() else {
+            return false;
+        };
+        nudge_ratio(tree, id, delta)
+    }
+
+    pub(crate) fn toggle_zoom_focused(&mut self) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        if !self.is_tiled(id) {
+            return false;
+        }
+        self.zoomed = if self.zoomed == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
+        true
+    }
+
+    pub(crate) fn toggle_float_focused(&mut self, geom: FloatGeom) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        if self.floating.remove(&id).is_some() {
+            let tree = self.tiled.take();
+            self.tiled = Some(dock_leaf(tree, id, SplitDir::Horizontal));
+            self.zoomed = None;
+            return true;
+        }
+
+        let Some(tree) = self.tiled.as_mut() else {
+            return false;
+        };
+        match close_leaf(tree, id) {
+            CloseOutcome::Closed(_) => {}
+            CloseOutcome::WasLast => self.tiled = None,
+            CloseOutcome::NotFound => return false,
+        }
+        self.floating.insert(id, geom);
+        self.focused = Some(id);
+        self.zoomed = None;
+        true
     }
 
     pub(crate) fn close_pane(&mut self, id: PaneId) -> bool {
@@ -49,8 +166,21 @@ impl Session {
             return !self.panes.is_empty();
         };
         self.panes.remove(pos);
+        let mut preferred_focus = None;
+        if self.floating.remove(&id).is_none()
+            && let Some(tree) = self.tiled.as_mut()
+        {
+            match close_leaf(tree, id) {
+                CloseOutcome::Closed(focus) => preferred_focus = Some(focus),
+                CloseOutcome::WasLast => self.tiled = None,
+                CloseOutcome::NotFound => {}
+            }
+        }
+        if self.zoomed == Some(id) {
+            self.zoomed = None;
+        }
         if self.focused == Some(id) {
-            self.focused = self.panes.first().map(|spec| spec.id);
+            self.focused = preferred_focus.or_else(|| self.focus_order().first().copied());
         }
         !self.panes.is_empty()
     }
@@ -61,7 +191,31 @@ impl Session {
         self.next_pane_id += 1;
         self.panes.push(PaneSpec::shell(id, cwd));
         self.focused = Some(id);
+        let tree = self.tiled.take();
+        self.tiled = Some(dock_leaf(tree, id, SplitDir::Horizontal));
         id
+    }
+
+    fn focus_by(&mut self, delta: isize) {
+        let order = self.focus_order();
+        if order.is_empty() {
+            self.focused = None;
+            return;
+        }
+        let current = self
+            .focused
+            .and_then(|id| order.iter().position(|pane| *pane == id))
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(order.len() as isize) as usize;
+        self.focused = Some(order[next]);
+        self.zoomed = None;
+    }
+
+    fn focus_order(&self) -> Vec<PaneId> {
+        let mut order = self.tiled.as_ref().map(leaves).unwrap_or_default();
+        order.extend(self.floating.keys().copied());
+        order.retain(|id| self.spec(*id).is_some());
+        order
     }
 }
 
@@ -73,7 +227,7 @@ pub(crate) struct PaneSpec {
 }
 
 impl PaneSpec {
-    fn shell(id: PaneId, cwd: PathBuf) -> Self {
+    pub(crate) fn shell(id: PaneId, cwd: PathBuf) -> Self {
         Self {
             id,
             title: "SHELL".to_string(),
@@ -103,6 +257,8 @@ mod tests {
         assert_eq!(session.pane_specs().len(), 1);
         assert_eq!(session.pane_specs()[0].title, "SHELL");
         assert_eq!(session.next_pane_id, 1);
+        assert_eq!(session.tiled(), Some(&TileNode::Leaf(PaneId(0))));
+        assert!(session.floating().is_empty());
     }
 
     #[test]
@@ -129,5 +285,83 @@ mod tests {
 
         assert!(!session.close_pane(PaneId(0)));
         assert_eq!(session.focused(), None);
+    }
+
+    #[test]
+    fn splitting_focused_shell_updates_layout_and_focus() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        let spec = session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert_eq!(spec.id, PaneId(1));
+        assert_eq!(session.focused(), Some(PaneId(1)));
+        assert_eq!(
+            session.tiled().map(leaves),
+            Some(vec![PaneId(0), PaneId(1)])
+        );
+    }
+
+    #[test]
+    fn floating_focus_can_be_docked_without_losing_runtime_identity() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 4,
+            y: 3,
+            width: 20,
+            height: 10,
+        }));
+        assert!(session.is_floating(PaneId(1)));
+        assert_eq!(session.tiled().map(leaves), Some(vec![PaneId(0)]));
+
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }));
+        assert!(!session.is_floating(PaneId(1)));
+        assert_eq!(
+            session.tiled().map(leaves),
+            Some(vec![PaneId(0), PaneId(1)])
+        );
+    }
+
+    #[test]
+    fn focus_cycles_through_tiled_then_floating_panes() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 4,
+            y: 3,
+            width: 20,
+            height: 10,
+        }));
+
+        session.focus_next();
+        assert_eq!(session.focused(), Some(PaneId(0)));
+        session.focus_next();
+        assert_eq!(session.focused(), Some(PaneId(1)));
+        session.focus_prev();
+        assert_eq!(session.focused(), Some(PaneId(0)));
+    }
+
+    #[test]
+    fn changing_focus_clears_zoom() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_zoom_focused());
+        assert_eq!(session.zoomed(), Some(PaneId(1)));
+
+        session.focus_prev();
+        assert_eq!(session.focused(), Some(PaneId(0)));
+        assert_eq!(session.zoomed(), None);
     }
 }

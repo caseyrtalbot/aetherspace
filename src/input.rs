@@ -3,6 +3,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::action::Action;
+use crate::layout::SplitDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InputConfig {
@@ -114,6 +115,28 @@ impl InputRouter {
             KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
             KeyCode::Char('r') | KeyCode::Char('R') => Action::RestartFocusedPane,
             KeyCode::Char('x') | KeyCode::Char('X') => Action::CloseFocusedPane,
+            KeyCode::Char('|') => Action::SplitFocusedPane {
+                dir: SplitDir::Horizontal,
+            },
+            KeyCode::Char('-') => Action::SplitFocusedPane {
+                dir: SplitDir::Vertical,
+            },
+            KeyCode::Tab
+            | KeyCode::Right
+            | KeyCode::Down
+            | KeyCode::Char('n')
+            | KeyCode::Char('N') => Action::FocusNext,
+            KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Up
+            | KeyCode::Char('p')
+            | KeyCode::Char('P') => Action::FocusPrev,
+            KeyCode::Char('>') | KeyCode::Char('=') | KeyCode::Char('+') => {
+                Action::ResizeFocusedPane { delta: 5 }
+            }
+            KeyCode::Char('<') | KeyCode::Char('_') => Action::ResizeFocusedPane { delta: -5 },
+            KeyCode::Char('z') | KeyCode::Char('Z') => Action::ToggleZoomFocusedPane,
+            KeyCode::Char('f') | KeyCode::Char('F') => Action::ToggleFloatFocusedPane,
             KeyCode::Esc => Action::Render,
             _ if self.config.leader.matches(key) => Action::SendBytes(self.config.leader.bytes()),
             _ => Action::Render,
@@ -259,6 +282,39 @@ mod tests {
         assert_eq!(
             router.route_key(key(KeyCode::Char('x'))),
             Action::CloseFocusedPane
+        );
+    }
+
+    #[test]
+    fn leader_routes_phase3_layout_actions() {
+        let mut router = InputRouter::new(InputConfig::default());
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('|'))),
+            Action::SplitFocusedPane {
+                dir: SplitDir::Horizontal
+            }
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(router.route_key(key(KeyCode::Tab)), Action::FocusNext);
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('>'))),
+            Action::ResizeFocusedPane { delta: 5 }
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('z'))),
+            Action::ToggleZoomFocusedPane
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('f'))),
+            Action::ToggleFloatFocusedPane
         );
     }
 }

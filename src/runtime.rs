@@ -1,4 +1,4 @@
-//! Unified runtime loop for the Phase 2 shell surface.
+//! Unified runtime loop for the Phase 3 layout surface.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,16 +11,17 @@ use ratatui::crossterm::event::{self, MouseEvent};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
 };
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::action::Action;
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::input::{InputConfig, InputRouter};
+use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
 use crate::session::{PaneId, Session};
 use crate::terminal::TerminalGuard;
@@ -101,9 +102,11 @@ impl RuntimeApp {
 
     fn resize_to_area(&mut self, area: Rect) {
         self.last_area = area;
-        let content = shell_content_rect(area);
-        for pane in self.panes.values_mut() {
-            pane.resize(content.height, content.width);
+        let content_rects = pane_content_rects(&self.session, area);
+        for (id, pane) in &mut self.panes {
+            if let Some(content) = content_rects.get(id) {
+                pane.resize(content.height, content.width);
+            }
         }
     }
 
@@ -123,6 +126,40 @@ impl RuntimeApp {
         pane.restart(&spec, self.scrollback, self.notify.clone())
     }
 
+    fn split_focused(&mut self, dir: SplitDir) -> Result<()> {
+        let cwd = self
+            .session
+            .focused_shell_cwd()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let Some(spec) = self.session.split_focused_shell(cwd, dir) else {
+            bail!("focused pane cannot be split");
+        };
+        let content_rects = pane_content_rects(&self.session, self.last_area);
+        let content = content_rects.get(&spec.id).copied().unwrap_or(Rect::new(
+            0,
+            0,
+            INITIAL_COLS,
+            INITIAL_ROWS,
+        ));
+        match PaneRuntime::spawn(
+            &spec,
+            content.height,
+            content.width,
+            self.scrollback,
+            self.notify.clone(),
+        ) {
+            Ok(pane) => {
+                self.panes.insert(spec.id, pane);
+                self.resize_to_area(self.last_area);
+                Ok(())
+            }
+            Err(e) => {
+                self.session.close_pane(spec.id);
+                Err(e)
+            }
+        }
+    }
+
     fn close_focused(&mut self) {
         let Some(id) = self.session.focused() else {
             self.running = false;
@@ -133,6 +170,37 @@ impl RuntimeApp {
         }
         if !self.session.close_pane(id) {
             self.running = false;
+        } else {
+            self.resize_to_area(self.last_area);
+        }
+    }
+
+    fn focus_next(&mut self) {
+        self.session.focus_next();
+        self.resize_to_area(self.last_area);
+    }
+
+    fn focus_prev(&mut self) {
+        self.session.focus_prev();
+        self.resize_to_area(self.last_area);
+    }
+
+    fn resize_focused(&mut self, delta: i16) {
+        if self.session.resize_focused(delta) {
+            self.resize_to_area(self.last_area);
+        }
+    }
+
+    fn toggle_zoom_focused(&mut self) {
+        if self.session.toggle_zoom_focused() {
+            self.resize_to_area(self.last_area);
+        }
+    }
+
+    fn toggle_float_focused(&mut self) {
+        let geom = FloatGeom::centered(workspace_rect(self.last_area));
+        if self.session.toggle_float_focused(geom) {
+            self.resize_to_area(self.last_area);
         }
     }
 
@@ -248,6 +316,14 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             }
             dirty
         }
+        Action::SplitFocusedPane { dir } => {
+            if let Err(e) = app.split_focused(dir) {
+                app.last_error = Some(format!("split failed: {e}"));
+            } else {
+                app.last_error = None;
+            }
+            true
+        }
         Action::RestartFocusedPane => {
             if let Err(e) = app.restart_focused() {
                 app.last_error = Some(format!("restart failed: {e}"));
@@ -260,87 +336,181 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             app.close_focused();
             true
         }
-        Action::FocusNext | Action::FocusPrev => true,
+        Action::FocusNext => {
+            app.focus_next();
+            true
+        }
+        Action::FocusPrev => {
+            app.focus_prev();
+            true
+        }
+        Action::ResizeFocusedPane { delta } => {
+            app.resize_focused(delta);
+            true
+        }
+        Action::ToggleZoomFocusedPane => {
+            app.toggle_zoom_focused();
+            true
+        }
+        Action::ToggleFloatFocusedPane => {
+            app.toggle_float_focused();
+            true
+        }
         Action::Noop => dirty,
     }
 }
 
 fn draw(frame: &mut Frame, app: &RuntimeApp) {
     let area = frame.area();
-    let shell_area = shell_area(area);
-    let content = shell_content_rect(area);
+    let workspace = workspace_rect(area);
     let status = status_rect(area);
 
-    if let Some((title, pane)) = focused_pane(app) {
-        let label_style = Theme::label_focused();
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {title}"), label_style))),
-            label_rect(shell_area),
-        );
-
-        if content.width > 0 && content.height > 0 {
-            let term = PseudoTerminal::new(pane.shell_screen())
-                .cursor(Cursor::default().visibility(pane.is_running()));
-            frame.render_widget(term, content);
-        }
-    } else {
+    let tiled = tiled_panes(&app.session, workspace);
+    if tiled.is_empty() && app.session.floating().is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " no pane",
                 Style::default().fg(Theme::DIM),
             ))),
-            label_rect(shell_area),
+            label_rect(workspace),
         );
+    }
+
+    if app.session.zoomed().is_none()
+        && let Some(tree) = app.session.tiled()
+    {
+        for sep in layout::separators(tree, workspace) {
+            draw_separator(frame, sep);
+        }
+    }
+
+    for pane in tiled {
+        draw_pane(frame, app, pane.id, pane.rect, false);
+    }
+
+    if app.session.zoomed().is_none() {
+        for (id, geom) in app.session.floating() {
+            let rect = layout::resolve_float(*geom, workspace);
+            draw_pane(frame, app, *id, rect, true);
+        }
     }
 
     let hint = if let Some(error) = &app.last_error {
         error.as_str()
     } else {
-        "^Space q: quit  r: restart  x: close"
+        "^Space |/- split  tab focus  </> size  z zoom  f float  r restart  x close  q quit"
     };
     let status_line = Line::from(vec![
         Span::styled(" Aetherspace ", Style::default().fg(Theme::FG)),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(" phase 2 pane runtime ", Style::default().fg(Theme::DIM)),
+        Span::styled(" phase 3 layout runtime ", Style::default().fg(Theme::DIM)),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
         Span::styled(format!(" {hint}"), Style::default().fg(Theme::DIM)),
     ]);
     frame.render_widget(Paragraph::new(status_line), status);
 }
 
-fn focused_pane(app: &RuntimeApp) -> Option<(String, &PaneRuntime)> {
-    let spec = app.session.focused_spec()?;
-    let pane = app.panes.get(&spec.id)?;
-    Some((pane.title(spec), pane))
+fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floating: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(spec) = app.session.spec(id) else {
+        return;
+    };
+    let Some(pane) = app.panes.get(&id) else {
+        return;
+    };
+
+    if floating {
+        frame.render_widget(Clear, area);
+    }
+
+    let focused = app.session.focused() == Some(id);
+    let label_style = if focused {
+        Theme::label_focused()
+    } else {
+        Theme::label()
+    };
+    let prefix = if floating { " FLOAT " } else { " " };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{prefix}{}", pane.title(spec)),
+            label_style,
+        ))),
+        label_rect(area),
+    );
+
+    let content = pane_content_rect(area);
+    if content.width > 0 && content.height > 0 {
+        let term = PseudoTerminal::new(pane.shell_screen())
+            .cursor(Cursor::default().visibility(focused && pane.is_running()));
+        frame.render_widget(term, content);
+    }
 }
 
-fn shell_area(area: Rect) -> Rect {
-    Layout::default()
+fn draw_separator(frame: &mut Frame, sep: layout::SepLine) {
+    let glyph = if sep.horizontal { "─" } else { "│" };
+    let style = Style::default().fg(Theme::HAIR);
+    let buffer = frame.buffer_mut();
+    for y in sep.rect.y..sep.rect.bottom() {
+        for x in sep.rect.x..sep.rect.right() {
+            buffer[(x, y)].set_symbol(glyph).set_style(style);
+        }
+    }
+}
+
+fn tiled_panes(session: &Session, workspace: Rect) -> Vec<SolvedPane> {
+    if let Some(id) = session.zoomed()
+        && session.is_tiled(id)
+    {
+        return vec![SolvedPane {
+            id,
+            rect: workspace,
+        }];
+    }
+    session
+        .tiled()
+        .map(|tree| layout::solve_tiled(tree, workspace))
+        .unwrap_or_default()
+}
+
+fn pane_content_rects(session: &Session, area: Rect) -> BTreeMap<PaneId, Rect> {
+    let workspace = workspace_rect(area);
+    let mut rects = BTreeMap::new();
+    for pane in tiled_panes(session, workspace) {
+        rects.insert(pane.id, pane_content_rect(pane.rect));
+    }
+    if session.zoomed().is_none() {
+        for (id, geom) in session.floating() {
+            let rect = layout::resolve_float(*geom, workspace);
+            rects.insert(*id, pane_content_rect(rect));
+        }
+    }
+    rects
+}
+
+fn workspace_rect(area: Rect) -> Rect {
+    RatatuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area)[0]
 }
 
-fn label_rect(shell_area: Rect) -> Rect {
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(shell_area)[0]
+fn label_rect(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.min(1))
 }
 
-fn shell_content_rect(area: Rect) -> Rect {
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(area)[1]
+fn pane_content_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
 }
 
 fn status_rect(area: Rect) -> Rect {
-    Layout::default()
+    RatatuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area)[1]
@@ -351,16 +521,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_content_excludes_label_and_statusline() {
+    fn workspace_excludes_statusline() {
         let area = Rect::new(0, 0, 80, 24);
-        let content = shell_content_rect(area);
-        assert_eq!(content, Rect::new(0, 1, 80, 22));
+        assert_eq!(workspace_rect(area), Rect::new(0, 0, 80, 23));
+        assert_eq!(status_rect(area), Rect::new(0, 23, 80, 1));
     }
 
     #[test]
-    fn tiny_terminal_still_has_valid_content_rect() {
+    fn pane_content_excludes_label() {
+        let area = Rect::new(2, 3, 80, 24);
+        let content = pane_content_rect(area);
+        assert_eq!(content, Rect::new(2, 4, 80, 23));
+    }
+
+    #[test]
+    fn tiny_pane_still_has_valid_content_rect() {
         let area = Rect::new(0, 0, 12, 1);
-        let content = shell_content_rect(area);
+        let content = pane_content_rect(area);
         assert_eq!(content.height, 0);
         assert_eq!(content.width, 12);
     }

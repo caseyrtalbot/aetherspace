@@ -60,6 +60,19 @@ Useful defaults:
 - `[workflow].startup_project`: exact project name to select first.
 - `[workflow].default_viewer`: project-relative viewer document.
 
+## Session State
+
+Clean exits save durable pane intent here:
+
+```sh
+${XDG_STATE_HOME:-~/.local/state}/aetherspace/session.toml
+```
+
+The file stores selected project, pane specs, tiled layout, floating geometry,
+focus, and zoom. It does not store PTY handles, process state, shell output, or
+viewer scroll position. If the file is missing or fails to parse, startup falls
+back to config-driven project selection.
+
 ## Boundaries
 
 Current deliberate non-goals:

@@ -44,6 +44,10 @@ All config fields are optional. With no config file, Aetherspace discovers git
 projects under `~/Projects`, selects the current project when possible, and opens
 `README.md` in viewer panes.
 
+Session layout is saved on clean exit to
+`$XDG_STATE_HOME/aetherspace/session.toml`, falling back to
+`~/.local/state/aetherspace/session.toml`.
+
 ## Controls
 
 Default leader: `Ctrl+Space`.

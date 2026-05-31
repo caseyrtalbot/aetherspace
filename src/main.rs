@@ -13,6 +13,7 @@ mod pane;
 mod pty;
 mod runtime;
 mod session;
+mod session_store;
 mod shell;
 mod terminal;
 mod theme;

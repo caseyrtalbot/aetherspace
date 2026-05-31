@@ -28,6 +28,7 @@ use crate::input::{InputConfig, InputRouter};
 use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
 use crate::session::{PaneId, PaneSpec, ProjectSelection, Session};
+use crate::session_store;
 use crate::terminal::TerminalGuard;
 use crate::theme::Theme;
 
@@ -40,33 +41,42 @@ pub(crate) fn run(config: Config) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let projects = config.resolve_projects();
-    let selected_project =
-        select_start_project(&projects, config.workflow.startup_project.as_deref(), &cwd);
-    let shell_cwd = selected_project
-        .and_then(|idx| projects.get(idx).map(|project| project.path.clone()))
-        .unwrap_or_else(|| cwd.clone());
-    let session = Session::single_shell_for_project(
-        shell_cwd,
-        selected_project
-            .and_then(|idx| projects.get(idx))
-            .map(project_selection),
-    );
+    let (session, selected_project, restored_session) =
+        initial_session(&projects, config.workflow.startup_project.as_deref(), &cwd);
     let scrollback = config.shell.scrollback;
-    let mut app = RuntimeApp::new(
+    let mut app = match RuntimeApp::new(
         session,
         InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
         scrollback,
         tx.clone(),
-        projects,
+        projects.clone(),
         selected_project,
-        config.workflow.default_viewer,
-    )?;
+        config.workflow.default_viewer.clone(),
+    ) {
+        Ok(app) => app,
+        Err(e) if restored_session => {
+            crate::log::warn(&format!("persisted session ignored: {e}"));
+            let (session, selected_project) =
+                fallback_session(&projects, config.workflow.startup_project.as_deref(), &cwd);
+            RuntimeApp::new(
+                session,
+                InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
+                scrollback,
+                tx.clone(),
+                projects,
+                selected_project,
+                config.workflow.default_viewer,
+            )?
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut guard = TerminalGuard::enter();
     panic_after_terminal_for_smoke();
     spawn_input_thread(tx);
 
     let result = run_loop(guard.terminal_mut(), &mut app, rx);
+    session_store::save(&app.session);
     app.shutdown();
     result
 }
@@ -1177,6 +1187,58 @@ fn resolve_viewer_path(project: &Project, default_viewer: &Path) -> PathBuf {
     }
 }
 
+fn initial_session(
+    projects: &[Project],
+    startup_project: Option<&str>,
+    cwd: &Path,
+) -> (Session, Option<usize>, bool) {
+    if let Some(mut session) = session_store::load() {
+        let persisted_selected = selected_project_from_session(&session, projects);
+        let selected =
+            persisted_selected.or_else(|| select_start_project(projects, startup_project, cwd));
+        if persisted_selected != selected
+            && let Some(index) = selected
+            && let Some(project) = projects.get(index)
+        {
+            session.select_project(project_selection(project));
+        }
+        return (session, selected, true);
+    }
+
+    let (session, selected) = fallback_session(projects, startup_project, cwd);
+    (session, selected, false)
+}
+
+fn fallback_session(
+    projects: &[Project],
+    startup_project: Option<&str>,
+    cwd: &Path,
+) -> (Session, Option<usize>) {
+    let selected = select_start_project(projects, startup_project, cwd);
+    let shell_cwd = selected
+        .and_then(|idx| projects.get(idx).map(|project| project.path.clone()))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let session = Session::single_shell_for_project(
+        shell_cwd,
+        selected
+            .and_then(|idx| projects.get(idx))
+            .map(project_selection),
+    );
+    (session, selected)
+}
+
+fn selected_project_from_session(session: &Session, projects: &[Project]) -> Option<usize> {
+    let selection = session.selected_project()?;
+    projects.iter().position(|project| {
+        project.name == selection.name || same_project_path(&project.path, &selection.path)
+    })
+}
+
+fn same_project_path(a: &Path, b: &Path) -> bool {
+    let normalize = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalize(a) == normalize(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1255,6 +1317,76 @@ mod tests {
         assert_eq!(
             resolve_viewer_path(&project, Path::new("README.md")),
             PathBuf::from("/work/one/docs/start.md")
+        );
+    }
+
+    #[test]
+    fn fallback_session_uses_startup_project_context() {
+        let projects = vec![Project {
+            name: "one".into(),
+            path: PathBuf::from("/work/one"),
+            viewer: None,
+        }];
+        let (session, selected) =
+            fallback_session(&projects, Some("one"), Path::new("/tmp/elsewhere"));
+        assert_eq!(selected, Some(0));
+        assert_eq!(
+            session.selected_project(),
+            Some(&ProjectSelection {
+                name: "one".into(),
+                path: PathBuf::from("/work/one"),
+            })
+        );
+    }
+
+    #[test]
+    fn selected_project_can_be_rehydrated_from_session() {
+        let projects = vec![Project {
+            name: "one".into(),
+            path: PathBuf::from("/work/one"),
+            viewer: None,
+        }];
+        let session = Session::single_shell_for_project(
+            PathBuf::from("/work/one"),
+            Some(ProjectSelection {
+                name: "one".into(),
+                path: PathBuf::from("/work/one"),
+            }),
+        );
+        assert_eq!(selected_project_from_session(&session, &projects), Some(0));
+    }
+
+    #[test]
+    fn loaded_session_updates_stale_project_selection_to_fallback() {
+        let projects = vec![Project {
+            name: "fresh".into(),
+            path: PathBuf::from("/work/fresh"),
+            viewer: None,
+        }];
+        let mut session = Session::single_shell_for_project(
+            PathBuf::from("/work/stale"),
+            Some(ProjectSelection {
+                name: "stale".into(),
+                path: PathBuf::from("/work/stale"),
+            }),
+        );
+        let persisted_selected = selected_project_from_session(&session, &projects);
+        let selected =
+            persisted_selected.or_else(|| select_start_project(&projects, None, Path::new("/tmp")));
+        if persisted_selected != selected
+            && let Some(index) = selected
+            && let Some(project) = projects.get(index)
+        {
+            session.select_project(project_selection(project));
+        }
+
+        assert_eq!(selected, Some(0));
+        assert_eq!(
+            session.selected_project(),
+            Some(&ProjectSelection {
+                name: "fresh".into(),
+                path: PathBuf::from("/work/fresh"),
+            })
         );
     }
 }

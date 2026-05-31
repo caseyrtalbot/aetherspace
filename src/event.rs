@@ -2,14 +2,28 @@
 
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEvent};
 
+use crate::session::PaneId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneProcessId {
+    pub(crate) pane: PaneId,
+    pub(crate) generation: u64,
+}
+
+impl PaneProcessId {
+    pub(crate) fn new(pane: PaneId, generation: u64) -> Self {
+        Self { pane, generation }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
     Resize(u16, u16),
-    Pty,
-    ChildExit,
+    Pty(PaneProcessId),
+    ChildExit(PaneProcessId),
     #[allow(dead_code)]
     Status,
     #[allow(dead_code)]

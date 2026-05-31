@@ -9,6 +9,8 @@ pub(crate) enum Action {
         rows: u16,
     },
     SendBytes(Vec<u8>),
+    RestartFocusedPane,
+    CloseFocusedPane,
     #[allow(dead_code)]
     FocusNext,
     #[allow(dead_code)]

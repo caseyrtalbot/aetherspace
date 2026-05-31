@@ -1,207 +1,177 @@
-//! Embedded real shell: a `$SHELL` child running inside a PTY, its output
-//! parsed by vt100 into a terminal screen that tui-term renders into a Ratatui
-//! pane. Stack: portable-pty (PTY + spawn) → vt100 (state machine) → tui-term
-//! (PseudoTerminal widget). vt100 comes from tui-term's own re-export so the
-//! Screen type always matches the widget's expected version.
+//! Restartable shell pane facade.
+//!
+//! `pty.rs` owns process handles and threads. This module owns the vt100 parser,
+//! shell lifecycle state, and stale-process generation checks.
 
-use std::io::{Read, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, sync_channel};
-use std::thread;
+use std::sync::mpsc::Sender;
 
 use anyhow::Result;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tui_term::vt100;
 
-use crate::event::RuntimeEvent;
+use crate::event::{PaneProcessId, RuntimeEvent};
+use crate::pty::PtyProcess;
+use crate::session::{PaneId, ShellSpec};
 
-/// Bound on the PTY byte channel: backpressure so a flood (`cat bigfile`, `yes`)
-/// can't grow memory unbounded. The reader blocks once 64 chunks are unread; the
-/// event loop drains them each wake. 64 * 8 KiB ≈ 512 KiB worst case in flight.
-const PTY_CHANNEL_DEPTH: usize = 64;
-
-pub struct Shell {
+pub(crate) struct Shell {
     parser: vt100::Parser,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-    rx: Receiver<Vec<u8>>,
-    // Edge-trigger for the wakeup: true while a Msg::Pty is outstanding. Lets a
-    // byte flood coalesce to one wakeup instead of one per chunk (see spawn).
-    pty_pending: Arc<AtomicBool>,
-    // Cleared by the reader thread on EOF (the child exited). The event loop reaps
-    // dead panes — see Workspace::reap_dead — collapsing the leaf into its sibling.
-    alive: Arc<AtomicBool>,
+    process: Option<PtyProcess>,
+    pane_id: PaneId,
+    generation: u64,
     rows: u16,
     cols: u16,
-    // Owned so the shell process lives as long as the pane, and so closing a pane
-    // can kill it — dropping the handle alone does not (see `terminate`).
-    child: Box<dyn Child + Send + Sync>,
+    scrollback: usize,
+    state: ShellState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellState {
+    Running,
+    Exited(String),
 }
 
 impl Shell {
-    /// Open a PTY, spawn the user's default shell, and start draining its output
-    /// on a background thread into a bounded channel. `notify` wakes the event loop
-    /// (Msg::Pty) when bytes land, so the loop can sleep at idle instead of polling.
-    ///
-    /// The wakeup is *edge-triggered*: the reader sets `pty_pending` and sends
-    /// Msg::Pty only on the false→true transition, so a saturating stream (`yes`,
-    /// `cat bigfile`) produces one outstanding wakeup, not one per chunk. Without
-    /// this, the loop's coalesce-drain could be re-fed faster than it drains and
-    /// never reach the draw, stalling output and the quit check. The flag is
-    /// cleared in `process_pending` before the byte channel is drained, so bytes
-    /// arriving mid-drain re-arm a fresh wakeup.
-    pub fn spawn(
+    pub(crate) fn spawn(
+        pane_id: PaneId,
+        spec: &ShellSpec,
         rows: u16,
         cols: u16,
         scrollback: usize,
         notify: Sender<RuntimeEvent>,
     ) -> Result<Self> {
-        let (rows, cols) = (rows.max(1), cols.max(1));
-        let pair = native_pty_system().openpty(PtySize {
+        let (rows, cols) = normalize_size(rows, cols);
+        let generation = 0;
+        let process = PtyProcess::spawn(
+            PaneProcessId::new(pane_id, generation),
+            spec,
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-
-        let child = pair
-            .slave
-            .spawn_command(CommandBuilder::new_default_prog())?;
-        // Drop the slave so the child receives EOF cleanly when it exits.
-        drop(pair.slave);
-
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
-        let master = pair.master;
-
-        let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_DEPTH);
-        let pty_pending = Arc::new(AtomicBool::new(false));
-        let pending = Arc::clone(&pty_pending);
-        let alive = Arc::new(AtomicBool::new(true));
-        let alive_reader = Arc::clone(&alive);
-        thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        // EOF or read error → the shell process ended. Mark the pane
-                        // dead and wake the loop once so it reaps this leaf; without
-                        // the wakeup an idle app would never notice the exit.
-                        alive_reader.store(false, Ordering::Release);
-                        let _ = notify.send(RuntimeEvent::ChildExit);
-                        break;
-                    }
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break; // receiver gone (app shutting down)
-                        }
-                        // Edge-triggered wakeup: notify only when none is pending.
-                        // Ignore send errors (gone receiver = shutting down).
-                        if !pending.swap(true, Ordering::AcqRel) {
-                            let _ = notify.send(RuntimeEvent::Pty);
-                        }
-                    }
-                }
-            }
-        });
-
+            notify,
+        )?;
         Ok(Self {
             parser: vt100::Parser::new(rows, cols, scrollback),
-            writer,
-            master,
-            rx,
-            pty_pending,
-            alive,
+            process: Some(process),
+            pane_id,
+            generation,
             rows,
             cols,
-            child,
+            scrollback,
+            state: ShellState::Running,
         })
     }
 
-    /// Whether the shell process is still running. False once its PTY hits EOF, so
-    /// the event loop can collapse the dead leaf into its sibling.
-    pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+    pub(crate) fn restart(
+        &mut self,
+        pane_id: PaneId,
+        spec: &ShellSpec,
+        scrollback: usize,
+        notify: Sender<RuntimeEvent>,
+    ) -> Result<()> {
+        self.terminate();
+        self.generation += 1;
+        self.pane_id = pane_id;
+        self.scrollback = scrollback;
+        let id = self.current_process_id();
+        let process = PtyProcess::spawn(id, spec, self.rows, self.cols, notify)?;
+        self.parser = vt100::Parser::new(self.rows, self.cols, self.scrollback);
+        self.process = Some(process);
+        self.state = ShellState::Running;
+        Ok(())
     }
 
-    /// Kill the shell's child process. Called when a pane is closed so the process
-    /// doesn't outlive its pane: dropping the `Shell` drops the child handle but does
-    /// not signal the process, and a still-running child keeps its PTY slave open, so
-    /// the reader thread never sees EOF on its own. Killing an already-exited child is
-    /// a harmless no-op. Once killed, the slave closes, the reader hits EOF, and the
-    /// reader thread winds itself down.
-    pub fn terminate(&mut self) {
-        let _ = self.child.kill();
-    }
-
-    /// Feed any bytes the shell has emitted since the last frame into the parser.
-    /// Clears the wakeup flag *before* draining, so a chunk that arrives mid-drain
-    /// re-arms a fresh Msg::Pty and is never lost.
-    pub fn process_pending(&mut self) {
-        self.pty_pending.store(false, Ordering::Release);
-        while let Ok(chunk) = self.rx.try_recv() {
-            self.parser.process(&chunk);
+    pub(crate) fn process_pending(&mut self, id: PaneProcessId) {
+        if id != self.current_process_id() {
+            return;
+        }
+        if let Some(process) = &mut self.process {
+            process.process_pending(|chunk| self.parser.process(chunk));
         }
     }
 
-    pub fn screen(&self) -> &vt100::Screen {
+    pub(crate) fn mark_child_exit(&mut self, id: PaneProcessId) {
+        if id != self.current_process_id() {
+            return;
+        }
+        self.process_pending(id);
+        let status = self
+            .process
+            .as_ref()
+            .and_then(PtyProcess::exit_status_text)
+            .unwrap_or_else(|| "exited".to_string());
+        self.process = None;
+        self.state = ShellState::Exited(status);
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.state, ShellState::Running)
+            && self
+                .process
+                .as_ref()
+                .map(PtyProcess::is_alive)
+                .unwrap_or(false)
+    }
+
+    pub(crate) fn terminate(&mut self) {
+        if let Some(process) = &mut self.process {
+            process.terminate();
+        }
+        self.process = None;
+    }
+
+    pub(crate) fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
 
-    /// Keep the PTY and the parser's screen sized to the visible pane.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        let (rows, cols) = (rows.max(1), cols.max(1));
+    pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
+        let (rows, cols) = normalize_size(rows, cols);
         if rows == self.rows && cols == self.cols {
             return;
         }
         self.rows = rows;
         self.cols = cols;
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(process) = &mut self.process {
+            process.resize(rows, cols);
+        }
         self.parser.screen_mut().set_size(rows, cols);
     }
 
-    pub fn send_input(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+    pub(crate) fn send_input(&mut self, bytes: &[u8]) {
+        if let Some(process) = &mut self.process {
+            process.send_input(bytes);
+        }
     }
 
-    /// Move the scrollback view by `delta` rows: positive scrolls up into history,
-    /// negative scrolls back toward the live bottom. The lower bound (0 = live) is
-    /// ours; the upper bound is vt100's, clamped inside `set_scrollback` to the
-    /// rows actually stored. On the alternate screen vt100 pins scrollback at 0
-    /// (screen.rs), so this is a no-op there — the caller uses that to tell a
-    /// scrollable primary buffer from an alt-screen app.
+    pub(crate) fn title(&self, base: &str) -> String {
+        match &self.state {
+            ShellState::Running => base.to_string(),
+            ShellState::Exited(status) => format!("{base}  exited: {status}"),
+        }
+    }
+
     #[allow(dead_code)]
-    pub fn scroll_by(&mut self, delta: i64) {
+    pub(crate) fn scroll_by(&mut self, delta: i64) {
         let target = scroll_delta(self.parser.screen().scrollback(), delta);
         self.parser.screen_mut().set_scrollback(target);
     }
 
-    /// Snap the view back to the live bottom (scrollback offset 0).
     #[allow(dead_code)]
-    pub fn scroll_to_bottom(&mut self) {
+    pub(crate) fn scroll_to_bottom(&mut self) {
         self.parser.screen_mut().set_scrollback(0);
     }
 
-    /// Current scrollback offset in rows: 0 at the live bottom, higher further
-    /// back. Drives the copy-mode position marker and the alt-screen detection.
     #[allow(dead_code)]
-    pub fn scrollback_offset(&self) -> usize {
+    pub(crate) fn scrollback_offset(&self) -> usize {
         self.parser.screen().scrollback()
+    }
+
+    fn current_process_id(&self) -> PaneProcessId {
+        PaneProcessId::new(self.pane_id, self.generation)
     }
 }
 
-/// New scrollback offset after moving `delta` rows (positive = further into
-/// history). Clamped at 0, the live bottom; the upper bound belongs to vt100 and
-/// is applied by `set_scrollback`. Pure, so the copy-mode scroll math is tested
-/// without a live PTY.
-#[allow(dead_code)]
+fn normalize_size(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.max(1), cols.max(1))
+}
+
 fn scroll_delta(current: usize, delta: i64) -> usize {
     (current as i64 + delta).max(0) as usize
 }
@@ -218,8 +188,13 @@ mod tests {
 
     #[test]
     fn scroll_delta_clamps_at_live_bottom() {
-        // Scrolling down past the live bottom never goes negative.
         assert_eq!(scroll_delta(3, -10), 0);
         assert_eq!(scroll_delta(0, -1), 0);
+    }
+
+    #[test]
+    fn shell_size_never_reaches_zero() {
+        assert_eq!(normalize_size(0, 0), (1, 1));
+        assert_eq!(normalize_size(22, 80), (22, 80));
     }
 }

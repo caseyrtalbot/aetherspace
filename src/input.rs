@@ -112,6 +112,8 @@ impl InputRouter {
     fn route_after_leader(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
+            KeyCode::Char('r') | KeyCode::Char('R') => Action::RestartFocusedPane,
+            KeyCode::Char('x') | KeyCode::Char('X') => Action::CloseFocusedPane,
             KeyCode::Esc => Action::Render,
             _ if self.config.leader.matches(key) => Action::SendBytes(self.config.leader.bytes()),
             _ => Action::Render,
@@ -242,5 +244,21 @@ mod tests {
         });
         assert_eq!(router.route_key(ctrl(KeyCode::Char('g'))), Action::Render);
         assert_eq!(router.route_key(key(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    #[test]
+    fn leader_routes_restart_and_close() {
+        let mut router = InputRouter::new(InputConfig::default());
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('r'))),
+            Action::RestartFocusedPane
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('x'))),
+            Action::CloseFocusedPane
+        );
     }
 }

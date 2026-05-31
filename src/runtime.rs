@@ -1,10 +1,12 @@
-//! Unified runtime loop for the Phase 1 shell surface.
+//! Unified runtime loop for the Phase 2 shell surface.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ratatui::crossterm::event::{self, MouseEvent};
 use ratatui::{
     Frame, Terminal,
@@ -17,18 +19,27 @@ use ratatui::{
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::action::Action;
-use crate::event::RuntimeEvent;
+use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::input::{InputConfig, InputRouter};
-use crate::shell::Shell;
+use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
+use crate::session::{PaneId, Session};
 use crate::terminal::TerminalGuard;
 use crate::theme::Theme;
 
 const FRAME: Duration = Duration::from_millis(16);
+const INITIAL_ROWS: u16 = 24;
+const INITIAL_COLS: u16 = 80;
 
 pub(crate) fn run(scrollback: usize) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
-    let shell = Shell::spawn(24, 80, scrollback, tx.clone())?;
-    let mut app = RuntimeApp::new(shell, InputRouter::new(InputConfig::default()));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let session = Session::single_shell(cwd);
+    let mut app = RuntimeApp::new(
+        session,
+        InputRouter::new(InputConfig::default()),
+        scrollback,
+        tx.clone(),
+    )?;
 
     let mut guard = TerminalGuard::enter();
     panic_after_terminal_for_smoke();
@@ -48,29 +59,93 @@ fn panic_after_terminal_for_smoke() {
 
 struct RuntimeApp {
     running: bool,
-    shell: Shell,
+    session: Session,
+    panes: BTreeMap<PaneId, PaneRuntime>,
     input: InputRouter,
     last_area: Rect,
+    scrollback: usize,
+    notify: Sender<RuntimeEvent>,
+    last_error: Option<String>,
 }
 
 impl RuntimeApp {
-    fn new(shell: Shell, input: InputRouter) -> Self {
-        Self {
+    fn new(
+        session: Session,
+        input: InputRouter,
+        scrollback: usize,
+        notify: Sender<RuntimeEvent>,
+    ) -> Result<Self> {
+        let mut panes = BTreeMap::new();
+        for spec in session.pane_specs() {
+            let pane =
+                PaneRuntime::spawn(spec, INITIAL_ROWS, INITIAL_COLS, scrollback, notify.clone())?;
+            panes.insert(spec.id, pane);
+        }
+        Ok(Self {
             running: true,
-            shell,
+            session,
+            panes,
             input,
             last_area: Rect::default(),
-        }
+            scrollback,
+            notify,
+            last_error: None,
+        })
     }
 
     fn shutdown(&mut self) {
-        self.shell.terminate();
+        for pane in self.panes.values_mut() {
+            pane.terminate();
+        }
     }
 
     fn resize_to_area(&mut self, area: Rect) {
         self.last_area = area;
         let content = shell_content_rect(area);
-        self.shell.resize(content.height, content.width);
+        for pane in self.panes.values_mut() {
+            pane.resize(content.height, content.width);
+        }
+    }
+
+    fn focused_pane_mut(&mut self) -> Option<&mut PaneRuntime> {
+        let id = self.session.focused()?;
+        self.panes.get_mut(&id)
+    }
+
+    fn restart_focused(&mut self) -> Result<()> {
+        let Some(id) = self.session.focused() else {
+            bail!("no focused pane to restart");
+        };
+        let spec = ensure_spec_matches_runtime(id, self.session.spec(id))?.clone();
+        let Some(pane) = self.panes.get_mut(&id) else {
+            bail!("focused pane {id:?} has no runtime");
+        };
+        pane.restart(&spec, self.scrollback, self.notify.clone())
+    }
+
+    fn close_focused(&mut self) {
+        let Some(id) = self.session.focused() else {
+            self.running = false;
+            return;
+        };
+        if let Some(mut pane) = self.panes.remove(&id) {
+            pane.terminate();
+        }
+        if !self.session.close_pane(id) {
+            self.running = false;
+        }
+    }
+
+    fn process_pty(&mut self, id: PaneProcessId) {
+        if let Some(pane) = self.panes.get_mut(&id.pane) {
+            pane.process_pending(id);
+        }
+    }
+
+    fn mark_child_exit(&mut self, id: PaneProcessId) {
+        if let Some(pane) = self.panes.get_mut(&id.pane) {
+            pane.mark_child_exit(id);
+        }
     }
 }
 
@@ -134,15 +209,16 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
         }
         RuntimeEvent::Resize(cols, rows) => apply_action(app, Action::Resize { cols, rows }),
         RuntimeEvent::Mouse(mouse) => handle_mouse(mouse),
-        RuntimeEvent::Pty => {
-            app.shell.process_pending();
-            if !app.shell.is_alive() {
-                app.running = false;
-            }
+        RuntimeEvent::Pty(id) => {
+            app.process_pty(id);
             true
         }
-        RuntimeEvent::ChildExit | RuntimeEvent::QuitRequested => {
-            app.shell.process_pending();
+        RuntimeEvent::ChildExit(id) => {
+            app.process_pty(id);
+            app.mark_child_exit(id);
+            true
+        }
+        RuntimeEvent::QuitRequested => {
             app.running = false;
             true
         }
@@ -167,8 +243,22 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             true
         }
         Action::SendBytes(bytes) => {
-            app.shell.send_input(&bytes);
+            if let Some(pane) = app.focused_pane_mut() {
+                pane.send_input(&bytes);
+            }
             dirty
+        }
+        Action::RestartFocusedPane => {
+            if let Err(e) = app.restart_focused() {
+                app.last_error = Some(format!("restart failed: {e}"));
+            } else {
+                app.last_error = None;
+            }
+            true
+        }
+        Action::CloseFocusedPane => {
+            app.close_focused();
+            true
         }
         Action::FocusNext | Action::FocusPrev => true,
         Action::Noop => dirty,
@@ -181,27 +271,47 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
     let content = shell_content_rect(area);
     let status = status_rect(area);
 
-    let label_style = Theme::label_focused();
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(" SHELL", label_style))),
-        label_rect(shell_area),
-    );
+    if let Some((title, pane)) = focused_pane(app) {
+        let label_style = Theme::label_focused();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {title}"), label_style))),
+            label_rect(shell_area),
+        );
 
-    if content.width > 0 && content.height > 0 {
-        let term =
-            PseudoTerminal::new(app.shell.screen()).cursor(Cursor::default().visibility(true));
-        frame.render_widget(term, content);
+        if content.width > 0 && content.height > 0 {
+            let term = PseudoTerminal::new(pane.shell_screen())
+                .cursor(Cursor::default().visibility(pane.is_running()));
+            frame.render_widget(term, content);
+        }
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " no pane",
+                Style::default().fg(Theme::DIM),
+            ))),
+            label_rect(shell_area),
+        );
     }
 
-    let hint = "^Space q: quit";
+    let hint = if let Some(error) = &app.last_error {
+        error.as_str()
+    } else {
+        "^Space q: quit  r: restart  x: close"
+    };
     let status_line = Line::from(vec![
         Span::styled(" Aetherspace ", Style::default().fg(Theme::FG)),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(" phase 1 boundary ", Style::default().fg(Theme::DIM)),
+        Span::styled(" phase 2 pane runtime ", Style::default().fg(Theme::DIM)),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
         Span::styled(format!(" {hint}"), Style::default().fg(Theme::DIM)),
     ]);
     frame.render_widget(Paragraph::new(status_line), status);
+}
+
+fn focused_pane(app: &RuntimeApp) -> Option<(String, &PaneRuntime)> {
+    let spec = app.session.focused_spec()?;
+    let pane = app.panes.get(&spec.id)?;
+    Some((pane.title(spec), pane))
 }
 
 fn shell_area(area: Rect) -> Rect {

@@ -130,6 +130,15 @@ impl Session {
         self.focus_by(-1);
     }
 
+    pub(crate) fn focus_pane(&mut self, id: PaneId) -> bool {
+        if self.spec(id).is_none() {
+            return false;
+        }
+        self.focused = Some(id);
+        self.zoomed = None;
+        true
+    }
+
     pub(crate) fn resize_focused(&mut self, delta: i16) -> bool {
         let Some(id) = self.focused else {
             return false;
@@ -466,5 +475,20 @@ mod tests {
         session.focus_prev();
         assert_eq!(session.focused(), Some(PaneId(0)));
         assert_eq!(session.zoomed(), None);
+    }
+
+    #[test]
+    fn focus_pane_selects_existing_pane_and_clears_zoom() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_zoom_focused());
+
+        assert!(session.focus_pane(PaneId(0)));
+        assert_eq!(session.focused(), Some(PaneId(0)));
+        assert_eq!(session.zoomed(), None);
+        assert!(!session.focus_pane(PaneId(99)));
+        assert_eq!(session.focused(), Some(PaneId(0)));
     }
 }

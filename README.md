@@ -56,10 +56,30 @@ Session layout is saved on clean exit to
 
 ## Controls
 
-Default leader: `Ctrl+Space`.
+The easiest controls are direct function keys:
 
 | Key | Action |
 | --- | --- |
+| `F1` | Help |
+| `F2` | Command palette |
+| `F3` | Project picker |
+| `F4` | Open viewer for selected project |
+| `F5` | Open shell for selected project |
+| `F6` / `F7` | Focus next / previous pane |
+| `F8` | Zoom focused tiled pane |
+| `F9` | Close focused pane |
+| `F10` | Quit and restore terminal |
+
+Click a pane to focus it unless the focused child shell app has enabled mouse
+capture. The command palette also includes `reset workspace`, which collapses a
+cluttered restored session back to one selected-project shell.
+
+Default leader: `Ctrl+Space`. The leader keys remain available when function
+keys are inconvenient.
+
+| Key | Action |
+| --- | --- |
+| `leader h` or `leader ?` | Help |
 | `leader c` or `leader :` | Command palette |
 | `leader p` | Project picker |
 | `leader v` | Open viewer for selected project |
@@ -81,7 +101,8 @@ The command palette includes status details for the current system, selected git
 repo, and configured health probes.
 
 Mouse events are forwarded to the focused shell only after the child app enables
-xterm mouse mode. Aetherspace still owns pane chrome and palette mouse events.
+xterm mouse mode. Aetherspace still owns pane chrome and palette mouse events;
+ordinary clicks focus panes.
 
 ## Verification
 

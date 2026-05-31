@@ -27,21 +27,37 @@ Expected path:
 1. The first shell pane renders and the statusline says `v0.1 tui`.
 2. After the first status poll, the statusline includes compact `sys` and `git`
    status; configured probes appear as `health:ok/total`.
-3. `Ctrl+Space c` opens the command palette.
-4. The `status details` command opens current system, git, and probe rows.
-5. `Enter` or `Esc` closes the status details palette.
-6. `Ctrl+Space v` opens a viewer pane for the selected project.
-7. `j` scrolls the focused viewer.
-8. `Ctrl+Space p` opens the project picker.
-9. `Enter` selects a project and opens a project shell.
-10. `Ctrl+Space q` exits with status 0 and restores the terminal.
+3. `F1` opens help; `Esc` or `Enter` closes it.
+4. `F2` opens the command palette.
+5. The `status details` command opens current system, git, and probe rows.
+6. `Enter` or `Esc` closes the status details palette.
+7. `F4` opens a viewer pane for the selected project.
+8. `j` scrolls the focused viewer.
+9. `F6` and `F7` move focus between panes.
+10. Clicking another pane focuses it when child mouse capture is inactive.
+11. `F3` opens the project picker.
+12. `Enter` selects a project and opens a project shell.
+13. `F2` then `reset workspace` collapses a cluttered session to one shell.
+14. `F10` exits with status 0 and restores the terminal.
+
+Legacy leader path:
+
+1. `Ctrl+Space c` opens the command palette.
+2. The `status details` command opens current system, git, and probe rows.
+3. `Enter` or `Esc` closes the status details palette.
+4. `Ctrl+Space v` opens a viewer pane for the selected project.
+5. `j` scrolls the focused viewer.
+6. `Ctrl+Space p` opens the project picker.
+7. `Enter` selects a project and opens a project shell.
+8. `Ctrl+Space q` exits with status 0 and restores the terminal.
 
 Optional mouse smoke:
 
 1. In a shell pane, run a child app that enables xterm mouse mode.
 2. Click inside the shell content area.
-3. The child receives coordinates relative to its pane; palette and pane chrome
-   clicks remain owned by Aetherspace.
+3. The child receives coordinates relative to its pane while capture is active.
+4. Click a non-capturing pane to focus it; palette and pane chrome clicks remain
+   owned by Aetherspace.
 
 Terminal recovery if a development build dies mid-frame:
 

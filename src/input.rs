@@ -225,6 +225,7 @@ impl InputRouter {
             KeyCode::Char('<') | KeyCode::Char('_') => Action::ResizeFocusedPane { delta: -5 },
             KeyCode::Char('z') | KeyCode::Char('Z') => Action::ToggleZoomFocusedPane,
             KeyCode::Char('f') | KeyCode::Char('F') => Action::ToggleFloatFocusedPane,
+            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Action::OpenHelp,
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char(':') => {
                 Action::OpenCommandPalette
             }
@@ -771,6 +772,12 @@ mod tests {
             router.route_key(key(KeyCode::Char('s'))),
             Action::OpenProjectShell
         );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(router.route_key(key(KeyCode::Char('h'))), Action::OpenHelp);
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(router.route_key(key(KeyCode::Char('?'))), Action::OpenHelp);
     }
 
     #[test]

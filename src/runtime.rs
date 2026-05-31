@@ -105,6 +105,7 @@ struct RuntimeApp {
     selected_project: Option<usize>,
     default_viewer: PathBuf,
     palette: Option<Palette>,
+    show_help: bool,
     last_area: Rect,
     scrollback: usize,
     notify: Sender<RuntimeEvent>,
@@ -144,6 +145,7 @@ enum PaletteCommand {
     OpenProjectViewer,
     OpenProjectShell,
     StatusDetails,
+    ResetWorkspace,
     SplitHorizontal,
     SplitVertical,
     ToggleFloat,
@@ -158,6 +160,12 @@ enum StatusTone {
     Normal,
     Notice,
     Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlobalShortcut {
+    Help,
+    Action(Action),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +195,11 @@ const COMMAND_ITEMS: &[CommandItem] = &[
         command: PaletteCommand::StatusDetails,
         label: "status details",
         detail: "show current sys/git/probes",
+    },
+    CommandItem {
+        command: PaletteCommand::ResetWorkspace,
+        label: "reset workspace",
+        detail: "collapse to one project shell",
     },
     CommandItem {
         command: PaletteCommand::SplitHorizontal,
@@ -247,6 +260,7 @@ impl RuntimeApp {
             selected_project: init.selected_project,
             default_viewer: init.default_viewer,
             palette: None,
+            show_help: false,
             last_area: Rect::default(),
             scrollback: init.scrollback,
             notify: init.notify,
@@ -366,6 +380,7 @@ impl RuntimeApp {
     }
 
     fn open_command_palette(&mut self) {
+        self.show_help = false;
         self.palette = Some(Palette {
             kind: PaletteKind::Commands,
             selected: 0,
@@ -373,6 +388,7 @@ impl RuntimeApp {
     }
 
     fn open_project_palette(&mut self) {
+        self.show_help = false;
         if self.projects.is_empty() {
             self.last_error = Some("no projects configured or discovered".to_string());
             self.palette = None;
@@ -388,10 +404,39 @@ impl RuntimeApp {
     }
 
     fn open_status_palette(&mut self) {
+        self.show_help = false;
         self.palette = Some(Palette {
             kind: PaletteKind::StatusDetails,
             selected: 0,
         });
+    }
+
+    fn open_help(&mut self) {
+        self.palette = None;
+        self.show_help = true;
+    }
+
+    fn reset_workspace(&mut self) -> Result<()> {
+        let selected = self.selected_project().cloned();
+        let cwd = selected
+            .as_ref()
+            .map(|project| project.path.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let selection = selected.as_ref().map(project_selection);
+
+        self.shutdown();
+        self.panes.clear();
+        self.session = Session::single_shell_for_project(cwd, selection);
+        let specs: Vec<PaneSpec> = self.session.pane_specs().to_vec();
+        for spec in specs {
+            self.spawn_runtime_for_spec(spec)?;
+        }
+        self.palette = None;
+        self.show_help = false;
+        self.last_error = None;
+        self.last_notice = Some("workspace reset to one project shell".to_string());
+        self.resize_to_area(self.last_area);
+        Ok(())
     }
 
     fn restart_focused(&mut self) -> Result<()> {
@@ -479,6 +524,14 @@ impl RuntimeApp {
         if self.palette.is_none() && self.forward_mouse_to_child(mouse) {
             return false;
         }
+        if self.palette.is_none()
+            && !self.show_help
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+            && self.focus_pane_at(mouse.column, mouse.row)
+        {
+            self.last_notice = Some("pane focused".to_string());
+            return true;
+        }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             return false;
         }
@@ -535,8 +588,36 @@ impl RuntimeApp {
             .unwrap_or(false)
     }
 
+    fn focus_pane_at(&mut self, column: u16, row: u16) -> bool {
+        if let Some(id) = self.pane_at(column, row)
+            && self.session.focus_pane(id)
+        {
+            self.resize_to_area(self.last_area);
+            return true;
+        }
+        false
+    }
+
+    fn pane_at(&self, column: u16, row: u16) -> Option<PaneId> {
+        let workspace = workspace_rect(self.last_area);
+        if self.session.zoomed().is_none() {
+            for (id, geom) in self.session.floating().iter().rev() {
+                let rect = layout::resolve_float(*geom, workspace);
+                if rect_contains(rect, column, row) {
+                    return Some(*id);
+                }
+            }
+        }
+        tiled_panes(&self.session, workspace)
+            .into_iter()
+            .find(|pane| rect_contains(pane.rect, column, row))
+            .map(|pane| pane.id)
+    }
+
     fn mouse_policy_notice(&self, mouse: MouseEvent) -> &'static str {
-        if self.palette.is_some() {
+        if self.show_help {
+            "mouse: help owns pointer"
+        } else if self.palette.is_some() {
             "mouse: palette owns pointer"
         } else if self.focused_child_mouse_enabled() {
             if self.focused_mouse_content_rect(mouse).is_some() {
@@ -645,6 +726,12 @@ impl RuntimeApp {
             }
             PaletteCommand::StatusDetails => {
                 self.open_status_palette();
+                true
+            }
+            PaletteCommand::ResetWorkspace => {
+                if let Err(e) = self.reset_workspace() {
+                    self.last_error = Some(format!("workspace reset failed: {e}"));
+                }
                 true
             }
             PaletteCommand::SplitHorizontal => apply_action(
@@ -775,6 +862,18 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
 }
 
 fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
+    if app.show_help {
+        return handle_help_key(app, key);
+    }
+    if let Some(shortcut) = global_shortcut(key) {
+        return match shortcut {
+            GlobalShortcut::Help => {
+                app.open_help();
+                true
+            }
+            GlobalShortcut::Action(action) => apply_action(app, action),
+        };
+    }
     if let Some(dirty) = app.handle_palette_key(key) {
         return dirty;
     }
@@ -783,6 +882,38 @@ fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     }
     let action = app.input.route_key(key);
     apply_action(app, action)
+}
+
+fn handle_help_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('?') => {
+            app.show_help = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn global_shortcut(key: KeyEvent) -> Option<GlobalShortcut> {
+    if key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::F(1) => Some(GlobalShortcut::Help),
+        KeyCode::F(2) => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
+        KeyCode::F(3) => Some(GlobalShortcut::Action(Action::OpenProjectPalette)),
+        KeyCode::F(4) => Some(GlobalShortcut::Action(Action::OpenProjectViewer)),
+        KeyCode::F(5) => Some(GlobalShortcut::Action(Action::OpenProjectShell)),
+        KeyCode::F(6) => Some(GlobalShortcut::Action(Action::FocusNext)),
+        KeyCode::F(7) => Some(GlobalShortcut::Action(Action::FocusPrev)),
+        KeyCode::F(8) => Some(GlobalShortcut::Action(Action::ToggleZoomFocusedPane)),
+        KeyCode::F(9) => Some(GlobalShortcut::Action(Action::CloseFocusedPane)),
+        KeyCode::F(10) => Some(GlobalShortcut::Action(Action::Quit)),
+        _ => None,
+    }
 }
 
 fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
@@ -842,6 +973,10 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
         }
         Action::ToggleFloatFocusedPane => {
             app.toggle_float_focused();
+            true
+        }
+        Action::OpenHelp => {
+            app.open_help();
             true
         }
         Action::OpenCommandPalette => {
@@ -909,6 +1044,9 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
 
     if app.palette.is_some() {
         draw_palette(frame, app, workspace);
+    }
+    if app.show_help {
+        draw_help(frame, workspace);
     }
 
     draw_statusline(frame, app, status);
@@ -999,6 +1137,50 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
         palette_lines(app, palette, inner.height, inner.width)
     };
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_help(frame: &mut Frame, workspace: Rect) {
+    let rect = overlay_rect(workspace, 84, 17);
+    if rect.width < 20 || rect.height < 8 {
+        return;
+    }
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" help ", Theme::label_focused())))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::HAIR));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let lines = vec![
+        help_line("F2", "commands", "open command palette"),
+        help_line("F3", "projects", "pick project and open shell"),
+        help_line("F4", "viewer", "open selected project README/viewer"),
+        help_line("F5", "shell", "open selected project shell"),
+        help_line("F6/F7", "focus", "move between panes"),
+        help_line("F8", "zoom", "toggle focused tiled pane"),
+        help_line("F9", "close", "close focused pane"),
+        help_line("F10", "quit", "save session and restore terminal"),
+        help_line("palette", "reset", "collapse clutter to one project shell"),
+        help_line(
+            "click",
+            "focus",
+            "select pane unless child mouse capture is active",
+        ),
+        help_line("^Space", "leader", "legacy command prefix still works"),
+        help_line("Esc/Enter", "close", "close this help panel"),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn help_line(key: &'static str, label: &'static str, detail: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(format!("{key:<8}"), Theme::selected_row()),
+        Span::styled(format!(" {label:<10}"), Style::default().fg(Theme::FG)),
+        Span::styled(detail, Style::default().fg(Theme::DIM)),
+    ])
 }
 
 fn palette_lines(
@@ -1143,6 +1325,11 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         (error.as_str(), StatusTone::Error)
     } else if let Some(notice) = &app.last_notice {
         (notice.as_str(), StatusTone::Notice)
+    } else if app.show_help {
+        (
+            "help  F2 commands  F6/F7 focus  F10 quit  esc close",
+            StatusTone::Normal,
+        )
     } else if matches!(
         app.palette,
         Some(Palette {
@@ -1158,21 +1345,24 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         ("enter run  up/down select  esc close", StatusTone::Normal)
     } else if app.focused_is_viewer() {
         (
-            "viewer  j/k scroll  pgup/pgdn page  leader commands",
+            "viewer  j/k scroll  F2 commands  F6 focus  F1 help",
             StatusTone::Normal,
         )
     } else if app.input.mode_label() == "leader" {
         (
-            "c palette  p projects  v viewer  s shell  |/- split  q quit",
+            "c commands  p projects  v viewer  s shell  h help  q quit",
             StatusTone::Normal,
         )
     } else if app.focused_child_mouse_enabled() {
         (
-            "shell capture  mouse->child  leader opens workflow",
+            "shell capture  mouse->child  F2 commands  F1 help",
             StatusTone::Normal,
         )
     } else {
-        ("shell capture  leader opens workflow", StatusTone::Normal)
+        (
+            "F1 help  F2 commands  F6 focus  F10 quit  ^Space leader",
+            StatusTone::Normal,
+        )
     }
 }
 
@@ -1448,6 +1638,34 @@ mod tests {
         assert!(rect_contains(rect, 12, 8));
         assert!(!rect_contains(rect, 13, 8));
         assert!(!rect_contains(rect, 12, 9));
+    }
+
+    #[test]
+    fn function_keys_route_global_shortcuts_without_stealing_question_mark() {
+        use ratatui::crossterm::event::KeyModifiers;
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            global_shortcut(key(KeyCode::F(1))),
+            Some(GlobalShortcut::Help)
+        );
+        assert_eq!(
+            global_shortcut(key(KeyCode::F(2))),
+            Some(GlobalShortcut::Action(Action::OpenCommandPalette))
+        );
+        assert_eq!(
+            global_shortcut(key(KeyCode::F(6))),
+            Some(GlobalShortcut::Action(Action::FocusNext))
+        );
+        assert_eq!(
+            global_shortcut(key(KeyCode::F(10))),
+            Some(GlobalShortcut::Action(Action::Quit))
+        );
+        assert_eq!(global_shortcut(key(KeyCode::Char('?'))), None);
+        assert_eq!(
+            global_shortcut(KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT)),
+            None
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Unified runtime loop for the Phase 3 layout surface.
+//! Unified runtime loop for the Phase 4 terminal-correctness surface.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use ratatui::crossterm::event::{self, MouseEvent};
+use ratatui::crossterm::event::{self, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -19,6 +19,7 @@ use ratatui::{
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::action::Action;
+use crate::config::Config;
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::input::{InputConfig, InputRouter};
 use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
@@ -30,14 +31,16 @@ use crate::theme::Theme;
 const FRAME: Duration = Duration::from_millis(16);
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
+const MAX_EVENTS_PER_TURN: usize = 256;
 
-pub(crate) fn run(scrollback: usize) -> Result<()> {
+pub(crate) fn run(config: Config) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let session = Session::single_shell(cwd);
+    let scrollback = config.shell.scrollback;
     let mut app = RuntimeApp::new(
         session,
-        InputRouter::new(InputConfig::default()),
+        InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
         scrollback,
         tx.clone(),
     )?;
@@ -67,6 +70,7 @@ struct RuntimeApp {
     scrollback: usize,
     notify: Sender<RuntimeEvent>,
     last_error: Option<String>,
+    last_notice: Option<String>,
 }
 
 impl RuntimeApp {
@@ -91,6 +95,7 @@ impl RuntimeApp {
             scrollback,
             notify,
             last_error: None,
+            last_notice: None,
         })
     }
 
@@ -205,8 +210,10 @@ impl RuntimeApp {
     }
 
     fn process_pty(&mut self, id: PaneProcessId) {
-        if let Some(pane) = self.panes.get_mut(&id.pane) {
-            pane.process_pending(id);
+        if let Some(pane) = self.panes.get_mut(&id.pane)
+            && pane.process_pending(id)
+        {
+            let _ = self.notify.send(RuntimeEvent::Pty(id));
         }
     }
 
@@ -214,6 +221,14 @@ impl RuntimeApp {
         if let Some(pane) = self.panes.get_mut(&id.pane) {
             pane.mark_child_exit(id);
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            return false;
+        }
+        self.last_notice = Some("mouse policy: child forwarding off".to_string());
+        true
     }
 }
 
@@ -246,9 +261,14 @@ where
     while app.running {
         let Ok(event) = rx.recv() else { break };
         let mut dirty = handle(app, event);
+        let mut handled = 1usize;
         while let Ok(event) = rx.try_recv() {
             dirty |= handle(app, event);
+            handled += 1;
             if !app.running {
+                break;
+            }
+            if handled >= MAX_EVENTS_PER_TURN {
                 break;
             }
         }
@@ -276,7 +296,7 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
             apply_action(app, action)
         }
         RuntimeEvent::Resize(cols, rows) => apply_action(app, Action::Resize { cols, rows }),
-        RuntimeEvent::Mouse(mouse) => handle_mouse(mouse),
+        RuntimeEvent::Mouse(mouse) => app.handle_mouse(mouse),
         RuntimeEvent::Pty(id) => {
             app.process_pty(id);
             true
@@ -292,10 +312,6 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
         }
         RuntimeEvent::Status | RuntimeEvent::Tick => true,
     }
-}
-
-fn handle_mouse(_mouse: MouseEvent) -> bool {
-    false
 }
 
 fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
@@ -314,6 +330,7 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             if let Some(pane) = app.focused_pane_mut() {
                 pane.send_input(&bytes);
             }
+            app.last_notice = None;
             dirty
         }
         Action::SplitFocusedPane { dir } => {
@@ -397,13 +414,26 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
 
     let hint = if let Some(error) = &app.last_error {
         error.as_str()
+    } else if let Some(notice) = &app.last_notice {
+        notice.as_str()
+    } else if app.input.mode_label() == "leader" {
+        "|/- split  tab focus  </> size  z zoom  f float  r restart  x close  q quit"
     } else {
-        "^Space |/- split  tab focus  </> size  z zoom  f float  r restart  x close  q quit"
+        "shell capture  mouse no-forward"
     };
+    let leader = app.input.leader_label();
     let status_line = Line::from(vec![
         Span::styled(" Aetherspace ", Style::default().fg(Theme::FG)),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
-        Span::styled(" phase 3 layout runtime ", Style::default().fg(Theme::DIM)),
+        Span::styled(
+            " phase 4 terminal correctness ",
+            Style::default().fg(Theme::DIM),
+        ),
+        Span::styled("│", Style::default().fg(Theme::HAIR)),
+        Span::styled(
+            format!(" {}:{} ", leader, app.input.mode_label()),
+            Style::default().fg(Theme::DIM),
+        ),
         Span::styled("│", Style::default().fg(Theme::HAIR)),
         Span::styled(format!(" {hint}"), Style::default().fg(Theme::DIM)),
     ]);

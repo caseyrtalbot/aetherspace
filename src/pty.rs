@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use portable_pty::{
@@ -18,6 +19,23 @@ use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::session::ShellSpec;
 
 const PTY_CHANNEL_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PtyDrainBudget {
+    max_bytes: usize,
+    max_chunks: usize,
+    max_time: Duration,
+}
+
+impl PtyDrainBudget {
+    pub(crate) fn interactive() -> Self {
+        Self {
+            max_bytes: 64 * 1024,
+            max_chunks: 32,
+            max_time: Duration::from_millis(4),
+        }
+    }
+}
 
 pub(crate) struct PtyProcess {
     writer: Box<dyn Write + Send>,
@@ -85,11 +103,26 @@ impl PtyProcess {
         })
     }
 
-    pub(crate) fn process_pending(&mut self, mut process: impl FnMut(&[u8])) {
+    pub(crate) fn process_pending(
+        &mut self,
+        budget: PtyDrainBudget,
+        mut process: impl FnMut(&[u8]),
+    ) -> bool {
         self.pty_pending.store(false, Ordering::Release);
+        let start = Instant::now();
+        let mut bytes = 0usize;
+        let mut chunks = 0usize;
+
         while let Ok(chunk) = self.rx.try_recv() {
+            bytes += chunk.len();
+            chunks += 1;
             process(&chunk);
+            if drain_budget_exhausted(start, bytes, chunks, budget) {
+                self.pty_pending.store(true, Ordering::Release);
+                return true;
+            }
         }
+        false
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
@@ -176,6 +209,15 @@ fn normalize_size(rows: u16, cols: u16) -> (u16, u16) {
     (rows.max(1), cols.max(1))
 }
 
+fn drain_budget_exhausted(
+    start: Instant,
+    bytes: usize,
+    chunks: usize,
+    budget: PtyDrainBudget,
+) -> bool {
+    bytes >= budget.max_bytes || chunks >= budget.max_chunks || start.elapsed() >= budget.max_time
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +226,18 @@ mod tests {
     fn pty_size_never_reaches_zero() {
         assert_eq!(normalize_size(0, 0), (1, 1));
         assert_eq!(normalize_size(24, 80), (24, 80));
+    }
+
+    #[test]
+    fn drain_budget_yields_on_byte_or_chunk_limits() {
+        let budget = PtyDrainBudget {
+            max_bytes: 10,
+            max_chunks: 3,
+            max_time: Duration::from_secs(60),
+        };
+        let start = Instant::now();
+        assert!(!drain_budget_exhausted(start, 9, 2, budget));
+        assert!(drain_budget_exhausted(start, 10, 2, budget));
+        assert!(drain_budget_exhausted(start, 9, 3, budget));
     }
 }

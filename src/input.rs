@@ -18,14 +18,34 @@ impl Default for InputConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl InputConfig {
+    pub(crate) fn from_leader_name(name: &str) -> Self {
+        Self {
+            leader: Leader::from_name(name).unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Leader {
+    #[default]
     CtrlSpace,
-    #[allow(dead_code)]
     Key(KeyBinding),
 }
 
 impl Leader {
+    fn from_name(name: &str) -> Option<Self> {
+        let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+        let normalized = normalized.replace('+', "-");
+        match normalized.as_str() {
+            "" | "ctrl-space" | "control-space" | "c-space" | "ctrl-@" | "control-@" => {
+                Some(Self::CtrlSpace)
+            }
+            "esc" | "escape" => Some(Self::Key(KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE))),
+            _ => parse_modified_char(&normalized),
+        }
+    }
+
     fn matches(self, key: KeyEvent) -> bool {
         match self {
             Self::CtrlSpace => {
@@ -42,6 +62,13 @@ impl Leader {
             Self::Key(binding) => encode_key(binding.into_key_event()),
         }
     }
+
+    fn label(self) -> String {
+        match self {
+            Self::CtrlSpace => "^Space".to_string(),
+            Self::Key(binding) => binding.label(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +78,6 @@ pub(crate) struct KeyBinding {
 }
 
 impl KeyBinding {
-    #[allow(dead_code)]
     pub(crate) fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
         Self { code, modifiers }
     }
@@ -63,34 +89,93 @@ impl KeyBinding {
     fn into_key_event(self) -> KeyEvent {
         KeyEvent::new(self.code, self.modifiers)
     }
+
+    fn label(self) -> String {
+        let key = match self.code {
+            KeyCode::Char(c) => c.to_ascii_uppercase().to_string(),
+            KeyCode::Esc => "Esc".to_string(),
+            KeyCode::Tab => "Tab".to_string(),
+            KeyCode::Backspace => "Backspace".to_string(),
+            _ => "?".to_string(),
+        };
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            format!("^{key}")
+        } else if self.modifiers.contains(KeyModifiers::ALT) {
+            format!("Alt-{key}")
+        } else {
+            key
+        }
+    }
+}
+
+fn parse_modified_char(normalized: &str) -> Option<Leader> {
+    let (modifiers, rest) = if let Some(rest) = normalized.strip_prefix("ctrl-") {
+        (KeyModifiers::CONTROL, rest)
+    } else if let Some(rest) = normalized.strip_prefix("control-") {
+        (KeyModifiers::CONTROL, rest)
+    } else if let Some(rest) = normalized.strip_prefix("c-") {
+        (KeyModifiers::CONTROL, rest)
+    } else if let Some(rest) = normalized.strip_prefix("alt-") {
+        (KeyModifiers::ALT, rest)
+    } else if let Some(rest) = normalized.strip_prefix("option-") {
+        (KeyModifiers::ALT, rest)
+    } else {
+        return None;
+    };
+
+    let code = match rest {
+        "space" => KeyCode::Char(' '),
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        _ if rest.chars().count() == 1 => KeyCode::Char(rest.chars().next()?),
+        _ => return None,
+    };
+    Some(Leader::Key(KeyBinding::new(code, modifiers)))
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct InputRouter {
     config: InputConfig,
-    leader_pending: bool,
+    mode: InputMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    ShellCapture,
+    Leader,
 }
 
 impl InputRouter {
     pub(crate) fn new(config: InputConfig) -> Self {
         Self {
             config,
-            leader_pending: false,
+            mode: InputMode::ShellCapture,
         }
     }
 
+    pub(crate) fn mode_label(&self) -> &'static str {
+        match self.mode {
+            InputMode::ShellCapture => "shell capture",
+            InputMode::Leader => "leader",
+        }
+    }
+
+    pub(crate) fn leader_label(&self) -> String {
+        self.config.leader.label()
+    }
+
     pub(crate) fn route_key(&mut self, key: KeyEvent) -> Action {
-        if key.kind != KeyEventKind::Press {
+        if key.kind == KeyEventKind::Release {
             return Action::Noop;
         }
 
-        if self.leader_pending {
-            self.leader_pending = false;
+        if self.mode == InputMode::Leader {
+            self.mode = InputMode::ShellCapture;
             return self.route_after_leader(key);
         }
 
         if self.config.leader.matches(key) {
-            self.leader_pending = true;
+            self.mode = InputMode::Leader;
             return Action::Render;
         }
 
@@ -106,7 +191,7 @@ impl InputRouter {
         if text.is_empty() {
             Action::Noop
         } else {
-            Action::SendBytes(text.into_bytes())
+            Action::SendBytes(encode_bracketed_paste(&text))
         }
     }
 
@@ -161,24 +246,106 @@ pub(crate) fn encode_key(key: KeyEvent) -> Vec<u8> {
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace if ctrl => vec![0x17],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Left => encode_csi_final('D', key.modifiers),
+        KeyCode::Right => encode_csi_final('C', key.modifiers),
+        KeyCode::Up => encode_csi_final('A', key.modifiers),
+        KeyCode::Down => encode_csi_final('B', key.modifiers),
+        KeyCode::Home => encode_csi_final('H', key.modifiers),
+        KeyCode::End => encode_csi_final('F', key.modifiers),
+        KeyCode::Insert => encode_csi_tilde(2, key.modifiers),
+        KeyCode::Delete => encode_csi_tilde(3, key.modifiers),
+        KeyCode::PageUp => encode_csi_tilde(5, key.modifiers),
+        KeyCode::PageDown => encode_csi_tilde(6, key.modifiers),
+        KeyCode::F(n) => encode_function_key(n, key.modifiers),
         _ => Vec::new(),
     };
 
-    if alt && !bytes.is_empty() && key.code != KeyCode::Esc {
+    if alt && alt_uses_escape_prefix(key.code) && !bytes.is_empty() {
         bytes.insert(0, 0x1b);
     }
     bytes
+}
+
+fn alt_uses_escape_prefix(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace
+    )
+}
+
+fn encode_bracketed_paste(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn encode_csi_final(final_byte: char, modifiers: KeyModifiers) -> Vec<u8> {
+    match modifier_param(modifiers) {
+        Some(param) => format!("\x1b[1;{param}{final_byte}").into_bytes(),
+        None => format!("\x1b[{final_byte}").into_bytes(),
+    }
+}
+
+fn encode_csi_tilde(number: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    match modifier_param(modifiers) {
+        Some(param) => format!("\x1b[{number};{param}~").into_bytes(),
+        None => format!("\x1b[{number}~").into_bytes(),
+    }
+}
+
+fn encode_function_key(n: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    let Some(param) = modifier_param(modifiers) else {
+        return match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => Vec::new(),
+        };
+    };
+
+    match n {
+        1 => format!("\x1b[1;{param}P").into_bytes(),
+        2 => format!("\x1b[1;{param}Q").into_bytes(),
+        3 => format!("\x1b[1;{param}R").into_bytes(),
+        4 => format!("\x1b[1;{param}S").into_bytes(),
+        5 => format!("\x1b[15;{param}~").into_bytes(),
+        6 => format!("\x1b[17;{param}~").into_bytes(),
+        7 => format!("\x1b[18;{param}~").into_bytes(),
+        8 => format!("\x1b[19;{param}~").into_bytes(),
+        9 => format!("\x1b[20;{param}~").into_bytes(),
+        10 => format!("\x1b[21;{param}~").into_bytes(),
+        11 => format!("\x1b[23;{param}~").into_bytes(),
+        12 => format!("\x1b[24;{param}~").into_bytes(),
+        _ => Vec::new(),
+    }
+}
+
+fn modifier_param(modifiers: KeyModifiers) -> Option<u8> {
+    let mut param = 1;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        param += 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        param += 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        param += 4;
+    }
+    (param > 1).then_some(param)
 }
 
 fn encode_control_char(c: char) -> Vec<u8> {
@@ -204,6 +371,10 @@ mod tests {
 
     fn alt(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     #[test]
@@ -249,8 +420,31 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_key_is_empty() {
-        assert!(encode_key(key(KeyCode::F(5))).is_empty());
+    fn function_keys_are_encoded() {
+        assert_eq!(encode_key(key(KeyCode::F(1))), b"\x1bOP".to_vec());
+        assert_eq!(encode_key(key(KeyCode::F(5))), b"\x1b[15~".to_vec());
+        assert_eq!(encode_key(shift(KeyCode::F(5))), b"\x1b[15;2~".to_vec());
+    }
+
+    #[test]
+    fn modified_special_keys_use_xterm_modifier_params() {
+        assert_eq!(encode_key(ctrl(KeyCode::Left)), b"\x1b[1;5D".to_vec());
+        assert_eq!(encode_key(alt(KeyCode::Delete)), b"\x1b[3;3~".to_vec());
+        assert_eq!(encode_key(shift(KeyCode::Home)), b"\x1b[1;2H".to_vec());
+    }
+
+    #[test]
+    fn unmapped_function_key_is_empty() {
+        assert!(encode_key(key(KeyCode::F(13))).is_empty());
+    }
+
+    #[test]
+    fn paste_is_bracketed_for_the_child() {
+        let router = InputRouter::new(InputConfig::default());
+        assert_eq!(
+            router.route_paste("hello\n".to_string()),
+            Action::SendBytes(b"\x1b[200~hello\n\x1b[201~".to_vec())
+        );
     }
 
     #[test]
@@ -262,10 +456,18 @@ mod tests {
 
     #[test]
     fn leader_can_be_configured() {
-        let mut router = InputRouter::new(InputConfig {
-            leader: Leader::Key(KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
-        });
+        let mut router = InputRouter::new(InputConfig::from_leader_name("ctrl-g"));
         assert_eq!(router.route_key(ctrl(KeyCode::Char('g'))), Action::Render);
+        assert_eq!(router.mode_label(), "leader");
+        assert_eq!(router.route_key(key(KeyCode::Char('q'))), Action::Quit);
+        assert_eq!(router.mode_label(), "shell capture");
+        assert_eq!(router.leader_label(), "^G");
+    }
+
+    #[test]
+    fn invalid_configured_leader_falls_back_to_ctrl_space() {
+        let mut router = InputRouter::new(InputConfig::from_leader_name("not-a-key"));
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
         assert_eq!(router.route_key(key(KeyCode::Char('q'))), Action::Quit);
     }
 
@@ -315,6 +517,23 @@ mod tests {
         assert_eq!(
             router.route_key(key(KeyCode::Char('f'))),
             Action::ToggleFloatFocusedPane
+        );
+    }
+
+    #[test]
+    fn shell_capture_passes_common_readline_keys_through() {
+        let mut router = InputRouter::new(InputConfig::default());
+        assert_eq!(
+            router.route_key(ctrl(KeyCode::Char('a'))),
+            Action::SendBytes(vec![0x01])
+        );
+        assert_eq!(
+            router.route_key(ctrl(KeyCode::Char('e'))),
+            Action::SendBytes(vec![0x05])
+        );
+        assert_eq!(
+            router.route_key(key(KeyCode::Tab)),
+            Action::SendBytes(vec![b'\t'])
         );
     }
 }

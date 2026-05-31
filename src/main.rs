@@ -24,6 +24,5 @@ fn main() -> Result<()> {
     log::init();
     log::info("aetherspace starting");
 
-    let config = config::Config::load();
-    runtime::run(config.shell.scrollback)
+    runtime::run(config::Config::load())
 }

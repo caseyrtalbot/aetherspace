@@ -9,7 +9,7 @@ use anyhow::Result;
 use tui_term::vt100;
 
 use crate::event::{PaneProcessId, RuntimeEvent};
-use crate::pty::PtyProcess;
+use crate::pty::{PtyDrainBudget, PtyProcess};
 use crate::session::{PaneId, ShellSpec};
 
 pub(crate) struct Shell {
@@ -78,20 +78,23 @@ impl Shell {
         Ok(())
     }
 
-    pub(crate) fn process_pending(&mut self, id: PaneProcessId) {
+    pub(crate) fn process_pending(&mut self, id: PaneProcessId) -> bool {
         if id != self.current_process_id() {
-            return;
+            return false;
         }
         if let Some(process) = &mut self.process {
-            process.process_pending(|chunk| self.parser.process(chunk));
+            return process.process_pending(PtyDrainBudget::interactive(), |chunk| {
+                self.parser.process(chunk);
+            });
         }
+        false
     }
 
     pub(crate) fn mark_child_exit(&mut self, id: PaneProcessId) {
         if id != self.current_process_id() {
             return;
         }
-        self.process_pending(id);
+        let _ = self.process_pending(id);
         let status = self
             .process
             .as_ref()

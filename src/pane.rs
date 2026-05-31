@@ -37,7 +37,7 @@ impl PaneRuntime {
         }
     }
 
-    pub(crate) fn process_pending(&mut self, id: PaneProcessId) {
+    pub(crate) fn process_pending(&mut self, id: PaneProcessId) -> bool {
         match self {
             Self::Shell(shell) => shell.process_pending(id),
         }

@@ -42,3 +42,7 @@ health_secs = 2  # probe GETs
 # Embedded shell settings.
 [shell]
 scrollback = 10000  # lines of PTY scrollback retained
+
+# Input settings.
+[input]
+leader = "ctrl-space"  # accepts ctrl-space, ctrl-@, ctrl-g, alt-g, esc

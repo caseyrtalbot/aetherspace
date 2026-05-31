@@ -33,6 +33,8 @@ pub struct Config {
     pub poll: PollCfg,
     /// Shell settings (scrollback depth, wired into the PTY parser).
     pub shell: ShellCfg,
+    /// Input settings: command leader and future keymap surface.
+    pub input: InputCfg,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             probes: Vec::new(),
             poll: PollCfg::default(),
             shell: ShellCfg::default(),
+            input: InputCfg::default(),
         }
     }
 }
@@ -92,6 +95,22 @@ pub struct ShellCfg {
 impl Default for ShellCfg {
     fn default() -> Self {
         Self { scrollback: 10_000 }
+    }
+}
+
+/// Input settings. `leader` is parsed by `input.rs`; invalid strings fall back
+/// to the default leader instead of making config loading fail.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct InputCfg {
+    pub leader: String,
+}
+
+impl Default for InputCfg {
+    fn default() -> Self {
+        Self {
+            leader: "ctrl-space".to_string(),
+        }
     }
 }
 
@@ -209,6 +228,9 @@ mod tests {
 
             [shell]
             scrollback = 50000
+
+            [input]
+            leader = "ctrl-g"
         "#;
         let cfg = Config::from_toml_or_default(toml);
         assert_eq!(cfg.projects_root, PathBuf::from("/srv/code"));
@@ -230,6 +252,7 @@ mod tests {
         assert_eq!(cfg.poll.git_secs, 30);
         assert_eq!(cfg.poll.health_secs, 3);
         assert_eq!(cfg.shell.scrollback, 50_000);
+        assert_eq!(cfg.input.leader, "ctrl-g");
     }
 
     #[test]
@@ -249,6 +272,7 @@ mod tests {
         assert_eq!(cfg.poll.git_secs, 10);
         assert_eq!(cfg.poll.health_secs, 2);
         assert_eq!(cfg.shell.scrollback, 10_000);
+        assert_eq!(cfg.input, InputCfg::default());
     }
 
     #[test]

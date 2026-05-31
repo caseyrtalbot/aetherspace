@@ -18,13 +18,14 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use tui_term::vt100::MouseProtocolMode;
 use tui_term::widget::{Cursor, PseudoTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::Action;
 use crate::config::{Config, Project};
 use crate::event::{PaneProcessId, RuntimeEvent};
-use crate::input::{InputConfig, InputRouter};
+use crate::input::{InputConfig, InputRouter, encode_mouse};
 use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
 use crate::session::{PaneId, PaneSpec, ProjectSelection, Session};
@@ -441,11 +442,77 @@ impl RuntimeApp {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.palette.is_none() && self.forward_mouse_to_child(mouse) {
+            return false;
+        }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             return false;
         }
-        self.last_notice = Some("mouse policy: child forwarding off".to_string());
+        self.last_notice = Some(self.mouse_policy_notice(mouse).to_string());
         true
+    }
+
+    fn forward_mouse_to_child(&mut self, mouse: MouseEvent) -> bool {
+        let Some((id, content)) = self.focused_mouse_content_rect(mouse) else {
+            return false;
+        };
+        let Some((mode, encoding)) = self
+            .panes
+            .get(&id)
+            .filter(|pane| pane.is_running())
+            .and_then(PaneRuntime::child_mouse_protocol)
+        else {
+            return false;
+        };
+        if mode == MouseProtocolMode::None {
+            return false;
+        }
+
+        let column = mouse.column.saturating_sub(content.x);
+        let row = mouse.row.saturating_sub(content.y);
+        let Some(bytes) = encode_mouse(mouse, column, row, mode, encoding) else {
+            return false;
+        };
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.send_input(&bytes);
+            self.last_notice = None;
+            return true;
+        }
+        false
+    }
+
+    fn focused_mouse_content_rect(&self, mouse: MouseEvent) -> Option<(PaneId, Rect)> {
+        let id = self.session.focused()?;
+        let content = *pane_content_rects(&self.session, self.last_area).get(&id)?;
+        if rect_contains(content, mouse.column, mouse.row) {
+            Some((id, content))
+        } else {
+            None
+        }
+    }
+
+    fn focused_child_mouse_enabled(&self) -> bool {
+        self.session
+            .focused()
+            .and_then(|id| self.panes.get(&id))
+            .filter(|pane| pane.is_running())
+            .and_then(PaneRuntime::child_mouse_protocol)
+            .map(|(mode, _)| mode != MouseProtocolMode::None)
+            .unwrap_or(false)
+    }
+
+    fn mouse_policy_notice(&self, mouse: MouseEvent) -> &'static str {
+        if self.palette.is_some() {
+            "mouse: palette owns pointer"
+        } else if self.focused_child_mouse_enabled() {
+            if self.focused_mouse_content_rect(mouse).is_some() {
+                "mouse: child mode ignored this event"
+            } else {
+                "mouse: outside child surface"
+            }
+        } else {
+            "mouse: child capture inactive"
+        }
     }
 
     fn handle_palette_key(&mut self, key: KeyEvent) -> Option<bool> {
@@ -1011,6 +1078,11 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
             "c palette  p projects  v viewer  s shell  |/- split  q quit",
             StatusTone::Normal,
         )
+    } else if app.focused_child_mouse_enabled() {
+        (
+            "shell capture  mouse->child  leader opens workflow",
+            StatusTone::Normal,
+        )
     } else {
         ("shell capture  leader opens workflow", StatusTone::Normal)
     }
@@ -1127,6 +1199,10 @@ fn pane_content_rects(session: &Session, area: Rect) -> BTreeMap<PaneId, Rect> {
         }
     }
     rects
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
 fn workspace_rect(area: Rect) -> Rect {
@@ -1263,6 +1339,15 @@ mod tests {
         let content = pane_content_rect(area);
         assert_eq!(content.height, 0);
         assert_eq!(content.width, 12);
+    }
+
+    #[test]
+    fn rect_contains_uses_exclusive_bottom_right_edges() {
+        let rect = Rect::new(3, 4, 10, 5);
+        assert!(rect_contains(rect, 3, 4));
+        assert!(rect_contains(rect, 12, 8));
+        assert!(!rect_contains(rect, 13, 8));
+        assert!(!rect_contains(rect, 12, 9));
     }
 
     #[test]

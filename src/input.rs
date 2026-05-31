@@ -1,6 +1,9 @@
 //! Input policy: leader handling and shell-safe key encoding.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::action::Action;
 use crate::layout::SplitDir;
@@ -290,6 +293,137 @@ fn encode_bracketed_paste(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// Translate a crossterm mouse event into bytes for a child PTY.
+///
+/// `column` and `row` are zero-based coordinates in the child pane's terminal
+/// content area. The emitted xterm coordinates are one-based.
+pub(crate) fn encode_mouse(
+    mouse: MouseEvent,
+    column: u16,
+    row: u16,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    if !mouse_event_enabled(mouse.kind, mode) {
+        return None;
+    }
+
+    let cb = mouse_cb(mouse, encoding);
+    let x = u32::from(column) + 1;
+    let y = u32::from(row) + 1;
+    match encoding {
+        MouseProtocolEncoding::Sgr => {
+            let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                'm'
+            } else {
+                'M'
+            };
+            Some(format!("\x1b[<{cb};{x};{y}{suffix}").into_bytes())
+        }
+        MouseProtocolEncoding::Default => encode_default_mouse(cb, x, y),
+        MouseProtocolEncoding::Utf8 => encode_utf8_mouse(cb, x, y),
+    }
+}
+
+fn mouse_event_enabled(kind: MouseEventKind, mode: MouseProtocolMode) -> bool {
+    match mode {
+        MouseProtocolMode::None => false,
+        MouseProtocolMode::Press => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        MouseProtocolMode::PressRelease => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        MouseProtocolMode::ButtonMotion => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        MouseProtocolMode::AnyMotion => true,
+    }
+}
+
+fn mouse_cb(mouse: MouseEvent, encoding: MouseProtocolEncoding) -> u16 {
+    let mut cb = match mouse.kind {
+        MouseEventKind::Down(button) => mouse_button_code(button),
+        MouseEventKind::Up(button) if encoding == MouseProtocolEncoding::Sgr => {
+            mouse_button_code(button)
+        }
+        MouseEventKind::Up(_) => 3,
+        MouseEventKind::Drag(button) => mouse_button_code(button) + 32,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if mouse.modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    cb
+}
+
+fn mouse_button_code(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn encode_default_mouse(cb: u16, x: u32, y: u32) -> Option<Vec<u8>> {
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        encode_default_mouse_value(u32::from(cb))?,
+        encode_default_mouse_value(x)?,
+        encode_default_mouse_value(y)?,
+    ])
+}
+
+fn encode_default_mouse_value(value: u32) -> Option<u8> {
+    (value <= 223).then_some((value + 32) as u8)
+}
+
+fn encode_utf8_mouse(cb: u16, x: u32, y: u32) -> Option<Vec<u8>> {
+    let mut out = b"\x1b[M".to_vec();
+    push_utf8_mouse_value(&mut out, u32::from(cb))?;
+    push_utf8_mouse_value(&mut out, x)?;
+    push_utf8_mouse_value(&mut out, y)?;
+    Some(out)
+}
+
+fn push_utf8_mouse_value(out: &mut Vec<u8>, value: u32) -> Option<()> {
+    let ch = char::from_u32(value + 32)?;
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    Some(())
+}
+
 fn encode_csi_final(final_byte: char, modifiers: KeyModifiers) -> Vec<u8> {
     match modifier_param(modifiers) {
         Some(param) => format!("\x1b[1;{param}{final_byte}").into_bytes(),
@@ -383,6 +517,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     #[test]
     fn ctrl_letters_map_to_control_bytes() {
         assert_eq!(encode_key(ctrl(KeyCode::Char('a'))), vec![0x01]);
@@ -450,6 +593,82 @@ mod tests {
         assert_eq!(
             router.route_paste("hello\n".to_string()),
             Action::SendBytes(b"\x1b[200~hello\n\x1b[201~".to_vec())
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_encodes_press_release_and_coordinates() {
+        assert_eq!(
+            encode_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                0,
+                0,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr,
+            ),
+            Some(b"\x1b[<0;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+                4,
+                7,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr,
+            ),
+            Some(b"\x1b[<0;5;8m".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_modes_filter_motion_events() {
+        assert_eq!(
+            encode_mouse(
+                mouse(MouseEventKind::Moved),
+                0,
+                0,
+                MouseProtocolMode::ButtonMotion,
+                MouseProtocolEncoding::Sgr,
+            ),
+            None
+        );
+        assert_eq!(
+            encode_mouse(
+                mouse(MouseEventKind::Moved),
+                0,
+                0,
+                MouseProtocolMode::AnyMotion,
+                MouseProtocolEncoding::Sgr,
+            ),
+            Some(b"\x1b[<35;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn default_mouse_uses_legacy_release_code() {
+        assert_eq!(
+            encode_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Right)),
+                0,
+                0,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default,
+            ),
+            Some(b"\x1b[M#!!".to_vec())
+        );
+    }
+
+    #[test]
+    fn default_mouse_drops_coordinates_outside_legacy_range() {
+        assert_eq!(
+            encode_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                223,
+                0,
+                MouseProtocolMode::Press,
+                MouseProtocolEncoding::Default,
+            ),
+            None
         );
     }
 

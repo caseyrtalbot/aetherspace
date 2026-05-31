@@ -71,6 +71,9 @@ Viewer panes accept `j/k`, `PageUp/PageDown`, `Home`, and `End` while focused.
 Shell panes stay in shell-capture mode, so readline keys and bracketed paste go
 to the child process unless the leader is pressed.
 
+Mouse events are forwarded to the focused shell only after the child app enables
+xterm mouse mode. Aetherspace still owns pane chrome and palette mouse events.
+
 ## Verification
 
 ```sh

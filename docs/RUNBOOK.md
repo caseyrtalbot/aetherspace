@@ -33,6 +33,13 @@ Expected path:
 7. `Enter` selects a project and opens a project shell.
 8. `Ctrl+Space q` exits with status 0 and restores the terminal.
 
+Optional mouse smoke:
+
+1. In a shell pane, run a child app that enables xterm mouse mode.
+2. Click inside the shell content area.
+3. The child receives coordinates relative to its pane; palette and pane chrome
+   clicks remain owned by Aetherspace.
+
 Terminal recovery if a development build dies mid-frame:
 
 ```sh
@@ -80,7 +87,8 @@ Current deliberate non-goals:
 - No native renderer as the default runtime.
 - No broad session persistence or storage layer.
 - No file-browser/editor expansion.
-- No child mouse forwarding yet; mouse activity is surfaced as no-forward policy.
+- No mouse-driven Aetherspace chrome manipulation yet. Child mouse forwarding is
+  limited to focused shell panes after the child enables an xterm mouse mode.
 
 Keep future work inside the runtime boundary: state changes before render, input
 routed through `input.rs`, lifecycle through `pane.rs`/`shell.rs`/`pty.rs`, and

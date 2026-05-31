@@ -6,7 +6,7 @@
 use std::sync::mpsc::Sender;
 
 use anyhow::Result;
-use tui_term::vt100;
+use tui_term::vt100::{self, MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::pty::{PtyDrainBudget, PtyProcess};
@@ -122,6 +122,14 @@ impl Shell {
 
     pub(crate) fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    pub(crate) fn mouse_protocol(&self) -> (MouseProtocolMode, MouseProtocolEncoding) {
+        let screen = self.parser.screen();
+        (
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        )
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {

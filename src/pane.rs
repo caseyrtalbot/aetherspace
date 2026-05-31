@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 
 use anyhow::{Result, bail};
 use ratatui::text::Line;
-use tui_term::vt100;
+use tui_term::vt100::{self, MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::session::{PaneId, PaneKind, PaneSpec};
@@ -118,6 +118,15 @@ impl PaneRuntime {
 
     pub(crate) fn is_viewer(&self) -> bool {
         matches!(self, Self::Viewer(_))
+    }
+
+    pub(crate) fn child_mouse_protocol(
+        &self,
+    ) -> Option<(MouseProtocolMode, MouseProtocolEncoding)> {
+        match self {
+            Self::Shell(shell) => Some(shell.mouse_protocol()),
+            Self::Viewer(_) => None,
+        }
     }
 
     pub(crate) fn scroll_viewer_by(&mut self, delta: isize, viewport_rows: u16) -> bool {

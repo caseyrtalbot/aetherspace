@@ -30,6 +30,7 @@ use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
 use crate::session::{PaneId, PaneSpec, ProjectSelection, Session};
 use crate::session_store;
+use crate::status::{self, StatusSnapshot, StatusTarget};
 use crate::terminal::TerminalGuard;
 use crate::theme::Theme;
 
@@ -42,32 +43,37 @@ pub(crate) fn run(config: Config) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let projects = config.resolve_projects();
+    let status_config = status::StatusConfig::from_config(&config);
     let (session, selected_project, restored_session) =
         initial_session(&projects, config.workflow.startup_project.as_deref(), &cwd);
+    let status_target = StatusTarget::new(selected_project_path(&projects, selected_project));
     let scrollback = config.shell.scrollback;
-    let mut app = match RuntimeApp::new(
+    let mut app = match RuntimeApp::new(RuntimeAppInit {
         session,
-        InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
+        input: InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
         scrollback,
-        tx.clone(),
-        projects.clone(),
+        notify: tx.clone(),
+        projects: projects.clone(),
         selected_project,
-        config.workflow.default_viewer.clone(),
-    ) {
+        default_viewer: config.workflow.default_viewer.clone(),
+        status_target: status_target.clone(),
+    }) {
         Ok(app) => app,
         Err(e) if restored_session => {
             crate::log::warn(&format!("persisted session ignored: {e}"));
             let (session, selected_project) =
                 fallback_session(&projects, config.workflow.startup_project.as_deref(), &cwd);
-            RuntimeApp::new(
+            status_target.set(selected_project_path(&projects, selected_project));
+            RuntimeApp::new(RuntimeAppInit {
                 session,
-                InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
+                input: InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
                 scrollback,
-                tx.clone(),
+                notify: tx.clone(),
                 projects,
                 selected_project,
-                config.workflow.default_viewer,
-            )?
+                default_viewer: config.workflow.default_viewer,
+                status_target: status_target.clone(),
+            })?
         }
         Err(e) => return Err(e),
     };
@@ -75,6 +81,7 @@ pub(crate) fn run(config: Config) -> Result<()> {
     let mut guard = TerminalGuard::enter();
     panic_after_terminal_for_smoke();
     spawn_input_thread(tx);
+    status::spawn_status_thread(status_config, status_target, app.notify.clone());
 
     let result = run_loop(guard.terminal_mut(), &mut app, rx);
     session_store::save(&app.session);
@@ -103,6 +110,19 @@ struct RuntimeApp {
     notify: Sender<RuntimeEvent>,
     last_error: Option<String>,
     last_notice: Option<String>,
+    status: StatusSnapshot,
+    status_target: StatusTarget,
+}
+
+struct RuntimeAppInit {
+    session: Session,
+    input: InputRouter,
+    scrollback: usize,
+    notify: Sender<RuntimeEvent>,
+    projects: Vec<Project>,
+    selected_project: Option<usize>,
+    default_viewer: PathBuf,
+    status_target: StatusTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,35 +219,34 @@ const COMMAND_ITEMS: &[CommandItem] = &[
 ];
 
 impl RuntimeApp {
-    fn new(
-        session: Session,
-        input: InputRouter,
-        scrollback: usize,
-        notify: Sender<RuntimeEvent>,
-        projects: Vec<Project>,
-        selected_project: Option<usize>,
-        default_viewer: PathBuf,
-    ) -> Result<Self> {
+    fn new(init: RuntimeAppInit) -> Result<Self> {
         let mut panes = BTreeMap::new();
-        for spec in session.pane_specs() {
-            let pane =
-                PaneRuntime::spawn(spec, INITIAL_ROWS, INITIAL_COLS, scrollback, notify.clone())?;
+        for spec in init.session.pane_specs() {
+            let pane = PaneRuntime::spawn(
+                spec,
+                INITIAL_ROWS,
+                INITIAL_COLS,
+                init.scrollback,
+                init.notify.clone(),
+            )?;
             panes.insert(spec.id, pane);
         }
         Ok(Self {
             running: true,
-            session,
+            session: init.session,
             panes,
-            input,
-            projects,
-            selected_project,
-            default_viewer,
+            input: init.input,
+            projects: init.projects,
+            selected_project: init.selected_project,
+            default_viewer: init.default_viewer,
             palette: None,
             last_area: Rect::default(),
-            scrollback,
-            notify,
+            scrollback: init.scrollback,
+            notify: init.notify,
             last_error: None,
             last_notice: None,
+            status: StatusSnapshot::default(),
+            status_target: init.status_target,
         })
     }
 
@@ -262,6 +281,7 @@ impl RuntimeApp {
         };
         self.selected_project = Some(index);
         self.session.select_project(project_selection(&project));
+        self.status_target.set(Some(project.path.clone()));
         self.last_notice = Some(format!("project selected: {}", project.name));
         self.last_error = None;
         Ok(())
@@ -726,7 +746,11 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
             app.running = false;
             true
         }
-        RuntimeEvent::Status | RuntimeEvent::Tick => true,
+        RuntimeEvent::Status(snapshot) => {
+            app.status = snapshot;
+            true
+        }
+        RuntimeEvent::Tick => true,
     }
 }
 
@@ -1046,6 +1070,14 @@ fn draw_statusline(frame: &mut Frame, app: &RuntimeApp, area: Rect) {
         Span::styled(format!("{leader}:{mode} "), Theme::status_meta()),
     ];
 
+    if let Some(status) = status::status_segment(&app.status) {
+        spans.push(sep());
+        spans.push(Span::styled(
+            truncate_width(&status, status_poll_budget(area.width)),
+            Theme::status_meta(),
+        ));
+    }
+
     let used = spans_width(&spans);
     let budget = area.width.saturating_sub(used).saturating_sub(3);
     if budget > 0 {
@@ -1114,6 +1146,14 @@ fn status_project_budget(width: u16) -> u16 {
         0..=79 => 14,
         80..=119 => 24,
         _ => 36,
+    }
+}
+
+fn status_poll_budget(width: u16) -> u16 {
+    match width {
+        0..=99 => 18,
+        100..=139 => 28,
+        _ => 42,
     }
 }
 
@@ -1245,6 +1285,10 @@ fn select_start_project(
                 .position(|project| cwd.starts_with(&project.path))
         })
         .or_else(|| (!projects.is_empty()).then_some(0))
+}
+
+fn selected_project_path(projects: &[Project], selected: Option<usize>) -> Option<PathBuf> {
+    selected.and_then(|index| projects.get(index).map(|project| project.path.clone()))
 }
 
 fn project_selection(project: &Project) -> ProjectSelection {

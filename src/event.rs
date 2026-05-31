@@ -3,6 +3,7 @@
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEvent};
 
 use crate::session::PaneId;
+use crate::status::StatusSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneProcessId {
@@ -24,8 +25,7 @@ pub(crate) enum RuntimeEvent {
     Resize(u16, u16),
     Pty(PaneProcessId),
     ChildExit(PaneProcessId),
-    #[allow(dead_code)]
-    Status,
+    Status(StatusSnapshot),
     #[allow(dead_code)]
     Tick,
     #[allow(dead_code)]

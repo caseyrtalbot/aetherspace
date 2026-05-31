@@ -9,7 +9,7 @@ The current build is intentionally terminal-first:
 - Ratatui is the renderer.
 - `portable-pty -> vt100 -> tui-term` owns embedded shells.
 - The runtime uses a single event queue for input, PTY output, resize, and child
-  exit notifications.
+  exit notifications, and status snapshots.
 - Session intent is separate from live process handles.
 - Native rendering, broad persistence, and editor/file-browser scope are deferred.
 
@@ -43,6 +43,10 @@ cp config.example.toml ~/.config/aetherspace/config.toml
 All config fields are optional. With no config file, Aetherspace discovers git
 projects under `~/Projects`, selects the current project when possible, and opens
 `README.md` in viewer panes.
+
+The statusline polls system CPU/memory, selected-project git branch/tracked dirty
+state, and any configured `[[probes]]` health URLs on the `[poll]` cadences.
+Probe failures are reported in the health count; they do not block startup.
 
 Session layout is saved on clean exit to
 `$XDG_STATE_HOME/aetherspace/session.toml`, falling back to

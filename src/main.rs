@@ -15,6 +15,7 @@ mod runtime;
 mod session;
 mod session_store;
 mod shell;
+mod status;
 mod terminal;
 mod theme;
 mod viewer;

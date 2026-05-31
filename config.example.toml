@@ -27,9 +27,8 @@ projects_root = "/Users/you/Projects"
 # path = "/Users/you/Projects/aetherspace"
 # viewer = "docs/working/GREENFIELD-TERMINAL-SPEC.md"
 
-# Statusline health probes. Each is GET'd on the health cadence; a reachable
-# endpoint shows a green dot, an unreachable one magenta. Default: none.
-# (Consumed starting in a later phase; documented here for the full format.)
+# Statusline health probes. Each is GET'd on the health cadence. Default: none.
+# The compact statusline reports reachable probes as health:ok/total.
 [[probes]]
 name = "spark"
 url = "http://localhost:9292/health"

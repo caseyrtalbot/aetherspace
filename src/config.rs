@@ -25,11 +25,9 @@ pub struct Config {
     /// Pinned project list. When `Some`, it is used verbatim and discovery is
     /// skipped entirely.
     pub projects: Option<Vec<ProjectEntry>>,
-    /// Health probes reserved for the status surface.
-    #[allow(dead_code)]
+    /// Health probes shown in the status surface.
     pub probes: Vec<ProbeEntry>,
-    /// Per-task poll cadences reserved for the status surface.
-    #[allow(dead_code)]
+    /// Per-task poll cadences for the status surface.
     pub poll: PollCfg,
     /// Shell settings (scrollback depth, wired into the PTY parser).
     pub shell: ShellCfg,
@@ -62,7 +60,6 @@ pub struct ProjectEntry {
 }
 
 /// A statusline health probe.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProbeEntry {
     pub name: String,
@@ -72,7 +69,6 @@ pub struct ProbeEntry {
 /// Poll cadences in seconds, decoupling the full git walk from the health probe.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
-#[allow(dead_code)]
 pub struct PollCfg {
     pub sys_secs: u64,
     pub git_secs: u64,

@@ -135,6 +135,7 @@ struct Palette {
 enum PaletteKind {
     Commands,
     Projects,
+    StatusDetails,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +143,7 @@ enum PaletteCommand {
     ProjectPicker,
     OpenProjectViewer,
     OpenProjectShell,
+    StatusDetails,
     SplitHorizontal,
     SplitVertical,
     ToggleFloat,
@@ -180,6 +182,11 @@ const COMMAND_ITEMS: &[CommandItem] = &[
         command: PaletteCommand::OpenProjectShell,
         label: "project shell",
         detail: "open shell at selected project",
+    },
+    CommandItem {
+        command: PaletteCommand::StatusDetails,
+        label: "status details",
+        detail: "show current sys/git/probes",
     },
     CommandItem {
         command: PaletteCommand::SplitHorizontal,
@@ -377,6 +384,13 @@ impl RuntimeApp {
                 .selected_project
                 .unwrap_or(0)
                 .min(self.projects.len() - 1),
+        });
+    }
+
+    fn open_status_palette(&mut self) {
+        self.palette = Some(Palette {
+            kind: PaletteKind::StatusDetails,
+            selected: 0,
         });
     }
 
@@ -582,6 +596,7 @@ impl RuntimeApp {
         match kind {
             PaletteKind::Commands => COMMAND_ITEMS.len(),
             PaletteKind::Projects => self.projects.len(),
+            PaletteKind::StatusDetails => status::status_detail_rows(&self.status).len(),
         }
     }
 
@@ -602,6 +617,7 @@ impl RuntimeApp {
                 }
                 true
             }
+            PaletteKind::StatusDetails => true,
         }
     }
 
@@ -625,6 +641,10 @@ impl RuntimeApp {
                 } else {
                     self.last_error = None;
                 }
+                true
+            }
+            PaletteCommand::StatusDetails => {
+                self.open_status_palette();
                 true
             }
             PaletteCommand::SplitHorizontal => apply_action(
@@ -948,6 +968,9 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
     let desired_height = match palette.kind {
         PaletteKind::Commands => (COMMAND_ITEMS.len() + 2) as u16,
         PaletteKind::Projects => (app.projects.len().min(12) + 2) as u16,
+        PaletteKind::StatusDetails => {
+            (app.palette_len(PaletteKind::StatusDetails).min(14) + 2) as u16
+        }
     };
     let rect = overlay_rect(workspace, 78, desired_height.max(5));
     if rect.width < 8 || rect.height < 3 {
@@ -958,6 +981,7 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
     let title = match palette.kind {
         PaletteKind::Commands => " command palette ",
         PaletteKind::Projects => " projects ",
+        PaletteKind::StatusDetails => " status details ",
     };
     let block = Block::default()
         .title(Line::from(Span::styled(title, Theme::label_focused())))
@@ -983,6 +1007,26 @@ fn palette_lines(
     height: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
+    if palette.kind == PaletteKind::StatusDetails {
+        let rows = status::status_detail_rows(&app.status);
+        let len = rows.len();
+        let view_rows = height.max(1) as usize;
+        let selected = palette.selected.min(len.saturating_sub(1));
+        let start = selected.saturating_sub(view_rows.saturating_sub(1));
+        let end = len.min(start + view_rows);
+        return (start..end)
+            .map(|idx| {
+                let row = &rows[idx];
+                palette_line(
+                    idx == selected,
+                    row.label.as_str(),
+                    row.detail.as_str(),
+                    width,
+                )
+            })
+            .collect();
+    }
+
     let len = app.palette_len(palette.kind);
     let rows = height.max(1) as usize;
     let selected = palette.selected.min(len.saturating_sub(1));
@@ -1003,6 +1047,7 @@ fn palette_lines(
                     width,
                 )
             }
+            PaletteKind::StatusDetails => unreachable!("status palette handled above"),
         })
         .collect()
 }
@@ -1098,6 +1143,17 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         (error.as_str(), StatusTone::Error)
     } else if let Some(notice) = &app.last_notice {
         (notice.as_str(), StatusTone::Notice)
+    } else if matches!(
+        app.palette,
+        Some(Palette {
+            kind: PaletteKind::StatusDetails,
+            ..
+        })
+    ) {
+        (
+            "status details  up/down inspect  enter/esc close",
+            StatusTone::Normal,
+        )
     } else if app.palette.is_some() {
         ("enter run  up/down select  esc close", StatusTone::Normal)
     } else if app.focused_is_viewer() {

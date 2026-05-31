@@ -41,6 +41,12 @@ pub(crate) struct ProbeSnapshot {
     pub(crate) ok: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusDetailRow {
+    pub(crate) label: String,
+    pub(crate) detail: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StatusConfig {
     poll: PollCfg,
@@ -219,6 +225,57 @@ pub(crate) fn status_segment(snapshot: &StatusSnapshot) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+pub(crate) fn status_detail_rows(snapshot: &StatusSnapshot) -> Vec<StatusDetailRow> {
+    let mut rows = Vec::new();
+
+    rows.push(match &snapshot.system {
+        Some(system) => StatusDetailRow::new(
+            "system",
+            format!(
+                "cpu {}%  memory {}%",
+                system.cpu_percent, system.memory_percent
+            ),
+        ),
+        None => StatusDetailRow::new("system", "waiting for first sample"),
+    });
+
+    rows.push(match &snapshot.git {
+        Some(git) => StatusDetailRow::new(
+            "git",
+            format!(
+                "{} {}",
+                git.branch,
+                if git.dirty { "dirty" } else { "clean" }
+            ),
+        ),
+        None => StatusDetailRow::new("git", "no repository sample"),
+    });
+
+    if snapshot.probes.is_empty() {
+        rows.push(StatusDetailRow::new("health", "no probes configured"));
+    } else {
+        let ok = snapshot.probes.iter().filter(|probe| probe.ok).count();
+        rows.push(StatusDetailRow::new(
+            "health",
+            format!("{ok}/{} probes reachable", snapshot.probes.len()),
+        ));
+        rows.extend(snapshot.probes.iter().map(|probe| {
+            StatusDetailRow::new(probe.name.as_str(), if probe.ok { "ok" } else { "failed" })
+        }));
+    }
+
+    rows
+}
+
+impl StatusDetailRow {
+    fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +318,41 @@ mod tests {
     #[test]
     fn status_segment_hides_empty_snapshot() {
         assert_eq!(status_segment(&StatusSnapshot::default()), None);
+    }
+
+    #[test]
+    fn status_details_include_probe_names_without_history() {
+        let rows = status_detail_rows(&StatusSnapshot {
+            system: Some(SystemSnapshot {
+                cpu_percent: 12,
+                memory_percent: 61,
+            }),
+            git: Some(GitSnapshot {
+                branch: "main".to_string(),
+                dirty: true,
+            }),
+            probes: vec![
+                ProbeSnapshot {
+                    name: "api".to_string(),
+                    ok: true,
+                },
+                ProbeSnapshot {
+                    name: "worker".to_string(),
+                    ok: false,
+                },
+            ],
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                StatusDetailRow::new("system", "cpu 12%  memory 61%"),
+                StatusDetailRow::new("git", "main dirty"),
+                StatusDetailRow::new("health", "1/2 probes reachable"),
+                StatusDetailRow::new("api", "ok"),
+                StatusDetailRow::new("worker", "failed"),
+            ]
+        );
     }
 
     #[test]

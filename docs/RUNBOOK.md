@@ -28,12 +28,13 @@ Expected path:
 2. After the first status poll, the statusline includes compact `sys` and `git`
    status; configured probes appear as `health:ok/total`.
 3. `Ctrl+Space c` opens the command palette.
-4. `Esc` closes the palette.
-5. `Ctrl+Space v` opens a viewer pane for the selected project.
-6. `j` scrolls the focused viewer.
-7. `Ctrl+Space p` opens the project picker.
-8. `Enter` selects a project and opens a project shell.
-9. `Ctrl+Space q` exits with status 0 and restores the terminal.
+4. The `status details` command opens current system, git, and probe rows.
+5. `Enter` or `Esc` closes the status details palette.
+6. `Ctrl+Space v` opens a viewer pane for the selected project.
+7. `j` scrolls the focused viewer.
+8. `Ctrl+Space p` opens the project picker.
+9. `Enter` selects a project and opens a project shell.
+10. `Ctrl+Space q` exits with status 0 and restores the terminal.
 
 Optional mouse smoke:
 
@@ -66,6 +67,7 @@ Useful defaults:
 - `projects_root`: git project discovery root.
 - `[[projects]]`: pinned project list, bypassing discovery.
 - `[[probes]]`: health URLs shown as `health:ok/total` in the statusline.
+  Probe names and current states are visible from command palette status details.
 - `[poll]`: system, git, and health polling cadences in seconds.
 - `[input].leader`: accepts `ctrl-space`, `ctrl-@`, `ctrl-g`, `alt-g`, and `esc`.
 - `[workflow].startup_project`: exact project name to select first.

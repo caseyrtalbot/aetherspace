@@ -46,7 +46,9 @@ projects under `~/Projects`, selects the current project when possible, and open
 
 The statusline polls system CPU/memory, selected-project git branch/tracked dirty
 state, and any configured `[[probes]]` health URLs on the `[poll]` cadences.
-Probe failures are reported in the health count; they do not block startup.
+Probe failures are reported in the health count; the command palette can show
+the current probe names and states. Status samples stay runtime-only and do not
+block startup.
 
 Session layout is saved on clean exit to
 `$XDG_STATE_HOME/aetherspace/session.toml`, falling back to
@@ -74,6 +76,9 @@ Default leader: `Ctrl+Space`.
 Viewer panes accept `j/k`, `PageUp/PageDown`, `Home`, and `End` while focused.
 Shell panes stay in shell-capture mode, so readline keys and bracketed paste go
 to the child process unless the leader is pressed.
+
+The command palette includes status details for the current system, selected git
+repo, and configured health probes.
 
 Mouse events are forwarded to the focused shell only after the child app enables
 xterm mouse mode. Aetherspace still owns pane chrome and palette mouse events.

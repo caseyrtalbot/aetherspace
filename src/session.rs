@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::{
-    CloseOutcome, FloatGeom, SplitDir, TileNode, close_leaf, contains_leaf, dock_leaf, leaves,
-    nudge_ratio, set_active_for_leaf, split_leaf, toggle_stack,
+    CloseOutcome, FloatGeom, SplitDir, TileNode, clamp_active, close_leaf, contains_leaf,
+    dock_leaf, leaves, nudge_ratio, set_active_for_leaf, split_leaf, toggle_stack,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -107,6 +107,16 @@ impl Session {
 
     pub(crate) fn tiled(&self) -> Option<&TileNode> {
         self.tiled.as_ref()
+    }
+
+    /// Normalize every `Stack` node's `active` index into range after a load. A
+    /// hand-edited or corrupted file can carry `active >= children.len()`, which the
+    /// panic-safe solver renders as an empty stack; clamping at load keeps a member
+    /// visible. Mutated in place; the tree is otherwise untouched.
+    pub(crate) fn clamp_stacks(&mut self) {
+        if let Some(tree) = self.tiled.as_mut() {
+            clamp_active(tree);
+        }
     }
 
     pub(crate) fn floating(&self) -> &std::collections::BTreeMap<PaneId, FloatGeom> {

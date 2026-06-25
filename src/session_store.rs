@@ -53,7 +53,7 @@ pub(crate) fn load_classified(path: &Path) -> Result<SessionLoad> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SessionLoad::None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let session: Session = match toml::from_str(&text) {
+    let mut session: Session = match toml::from_str(&text) {
         Ok(session) => session,
         Err(e) => {
             // A parse failure is usually a corrupt file, but it is ALSO how a file
@@ -83,6 +83,10 @@ pub(crate) fn load_classified(path: &Path) -> Result<SessionLoad> {
     if session.pane_specs().is_empty() {
         Ok(SessionLoad::None)
     } else {
+        // Normalize any out-of-range Stack `active` from a hand-edited/corrupt file
+        // before the tree reaches the renderer (the solver is panic-safe but would
+        // otherwise show an empty stack).
+        session.clamp_stacks();
         Ok(SessionLoad::Loaded(session))
     }
 }
@@ -361,5 +365,44 @@ Leaf = 0
         };
         assert_eq!(session.format_version(), 1);
         assert_eq!(session.pane_specs().len(), 1);
+    }
+
+    #[test]
+    fn out_of_range_stack_active_is_clamped_on_load() {
+        // A hand-edited/corrupt file whose Stack.active points past the last child
+        // must load with active clamped into range; the panic-safe solver would
+        // otherwise render an empty stack.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+
+        let mut session = Session::single_shell(PathBuf::from("/work/aetherspace"));
+        session
+            .split_focused_shell(PathBuf::from("/work/aetherspace"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_stack_focused(), "expected a stack to form");
+        save_to_path(&session, &path).unwrap();
+
+        // Point active past the two members (whichever index it serialized as).
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("active ="),
+            "stack body must carry an active key"
+        );
+        let corrupted = text
+            .replace("active = 0", "active = 9")
+            .replace("active = 1", "active = 9");
+        fs::write(&path, corrupted).unwrap();
+
+        let loaded = match load_classified(&path).unwrap() {
+            SessionLoad::Loaded(session) => session,
+            other => panic!("expected Loaded, got {other:?}"),
+        };
+        match loaded.tiled().expect("tiled tree") {
+            crate::layout::TileNode::Stack { active, children } => {
+                assert_eq!(children.len(), 2);
+                assert_eq!(*active, children.len() - 1, "active clamped to last member");
+            }
+            other => panic!("expected a Stack at the root, got {other:?}"),
+        }
     }
 }

@@ -348,6 +348,35 @@ pub(crate) fn set_active_for_leaf(node: &mut TileNode, id: PaneId) -> bool {
     }
 }
 
+/// Clamp every `Stack`'s `active` to a valid child index, recursively. A hand-edited
+/// or corrupted `session.toml` can deserialize a Stack whose `active >= children.len()`;
+/// the solver is panic-safe (`children.get(*active)` returns `None`) but renders an
+/// empty stack. Normalizing at load keeps a member visible. Runtime mutation paths
+/// re-clamp on their own (e.g. close), so this only matters at load. Returns true if
+/// anything changed (informational; the load path does not branch on it).
+pub(crate) fn clamp_active(node: &mut TileNode) -> bool {
+    match node {
+        TileNode::Leaf(_) => false,
+        TileNode::Split { a, b, .. } => {
+            let changed_a = clamp_active(a);
+            let changed_b = clamp_active(b);
+            changed_a || changed_b
+        }
+        TileNode::Stack { children, active } => {
+            let mut changed = false;
+            for child in children.iter_mut() {
+                changed |= clamp_active(child);
+            }
+            let max = children.len().saturating_sub(1);
+            if *active > max {
+                *active = max;
+                changed = true;
+            }
+            changed
+        }
+    }
+}
+
 /// Convert the focused leaf's parent `Split` into a `Stack` (collapsing the sibling
 /// subtree alongside it), or collapse the enclosing `Stack` back to a `Split`. The
 /// inverse uses survivor-promotion semantics: it does NOT reconstruct the original
@@ -564,6 +593,38 @@ mod tests {
             children: ids.iter().map(|i| TileNode::Leaf(PaneId(*i))).collect(),
             active,
         }
+    }
+
+    #[test]
+    fn clamp_active_pulls_out_of_range_index_into_bounds() {
+        // A hand-edited file with active past the last child would render an empty
+        // stack; clamp pulls it to the last valid index and reports the change.
+        let mut tree = stack_of(5, &[0, 1, 2]);
+        assert!(clamp_active(&mut tree));
+        let TileNode::Stack { active, .. } = &tree else {
+            panic!("expected stack");
+        };
+        assert_eq!(*active, 2);
+
+        // A valid index is untouched and reports no change (idempotent).
+        let mut ok = stack_of(1, &[0, 1, 2]);
+        assert!(!clamp_active(&mut ok));
+
+        // Stacks nested inside a split are reached too.
+        let mut nested = TileNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 50,
+            a: Box::new(TileNode::Leaf(PaneId(9))),
+            b: Box::new(stack_of(9, &[0, 1])),
+        };
+        assert!(clamp_active(&mut nested));
+        let TileNode::Split { b, .. } = &nested else {
+            panic!("expected split");
+        };
+        let TileNode::Stack { active, .. } = b.as_ref() else {
+            panic!("expected nested stack");
+        };
+        assert_eq!(*active, 1);
     }
 
     #[test]

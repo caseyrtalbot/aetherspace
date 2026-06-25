@@ -106,6 +106,7 @@ struct RuntimeApp {
     default_viewer: PathBuf,
     palette: Option<Palette>,
     show_help: bool,
+    compact_chrome: bool,
     last_area: Rect,
     scrollback: usize,
     notify: Sender<RuntimeEvent>,
@@ -150,6 +151,7 @@ enum PaletteCommand {
     SplitVertical,
     ToggleFloat,
     ToggleZoom,
+    ToggleCompact,
     Restart,
     Close,
     Quit,
@@ -222,6 +224,11 @@ const COMMAND_ITEMS: &[CommandItem] = &[
         detail: "toggle focused tiled pane",
     },
     CommandItem {
+        command: PaletteCommand::ToggleCompact,
+        label: "compact ui",
+        detail: "hide pane labels and statusline",
+    },
+    CommandItem {
         command: PaletteCommand::Restart,
         label: "reload/restart",
         detail: "restart shell or reload viewer",
@@ -261,6 +268,7 @@ impl RuntimeApp {
             default_viewer: init.default_viewer,
             palette: None,
             show_help: true,
+            compact_chrome: false,
             last_area: Rect::default(),
             scrollback: init.scrollback,
             notify: init.notify,
@@ -279,7 +287,7 @@ impl RuntimeApp {
 
     fn resize_to_area(&mut self, area: Rect) {
         self.last_area = area;
-        let content_rects = pane_content_rects(&self.session, area);
+        let content_rects = pane_content_rects(&self.session, area, self.compact_chrome);
         for (id, pane) in &mut self.panes {
             if let Some(content) = content_rects.get(id) {
                 pane.resize(content.height, content.width);
@@ -320,14 +328,14 @@ impl RuntimeApp {
         let Some(id) = self.session.focused() else {
             return INITIAL_ROWS;
         };
-        pane_content_rects(&self.session, self.last_area)
+        pane_content_rects(&self.session, self.last_area, self.compact_chrome)
             .get(&id)
             .map(|rect| rect.height)
             .unwrap_or(INITIAL_ROWS)
     }
 
     fn spawn_runtime_for_spec(&mut self, spec: PaneSpec) -> Result<()> {
-        let content_rects = pane_content_rects(&self.session, self.last_area);
+        let content_rects = pane_content_rects(&self.session, self.last_area, self.compact_chrome);
         let content = content_rects.get(&spec.id).copied().unwrap_or(Rect::new(
             0,
             0,
@@ -500,7 +508,7 @@ impl RuntimeApp {
     }
 
     fn toggle_float_focused(&mut self) {
-        let geom = FloatGeom::centered(workspace_rect(self.last_area));
+        let geom = FloatGeom::centered(workspace_rect(self.last_area, self.compact_chrome));
         if self.session.toggle_float_focused(geom) {
             self.resize_to_area(self.last_area);
         }
@@ -570,7 +578,8 @@ impl RuntimeApp {
 
     fn focused_mouse_content_rect(&self, mouse: MouseEvent) -> Option<(PaneId, Rect)> {
         let id = self.session.focused()?;
-        let content = *pane_content_rects(&self.session, self.last_area).get(&id)?;
+        let content =
+            *pane_content_rects(&self.session, self.last_area, self.compact_chrome).get(&id)?;
         if rect_contains(content, mouse.column, mouse.row) {
             Some((id, content))
         } else {
@@ -599,7 +608,7 @@ impl RuntimeApp {
     }
 
     fn pane_at(&self, column: u16, row: u16) -> Option<PaneId> {
-        let workspace = workspace_rect(self.last_area);
+        let workspace = workspace_rect(self.last_area, self.compact_chrome);
         if self.session.zoomed().is_none() {
             for (id, geom) in self.session.floating().iter().rev() {
                 let rect = layout::resolve_float(*geom, workspace);
@@ -748,6 +757,7 @@ impl RuntimeApp {
             ),
             PaletteCommand::ToggleFloat => apply_action(self, Action::ToggleFloatFocusedPane),
             PaletteCommand::ToggleZoom => apply_action(self, Action::ToggleZoomFocusedPane),
+            PaletteCommand::ToggleCompact => apply_action(self, Action::ToggleCompactChrome),
             PaletteCommand::Restart => apply_action(self, Action::RestartFocusedPane),
             PaletteCommand::Close => apply_action(self, Action::CloseFocusedPane),
             PaletteCommand::Quit => apply_action(self, Action::Quit),
@@ -1011,6 +1021,16 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             app.toggle_float_focused();
             true
         }
+        Action::ToggleCompactChrome => {
+            app.compact_chrome = !app.compact_chrome;
+            app.resize_to_area(app.last_area);
+            app.last_notice = Some(if app.compact_chrome {
+                "compact ui on".to_string()
+            } else {
+                "compact ui off".to_string()
+            });
+            true
+        }
         Action::OpenHelp => {
             app.open_help();
             true
@@ -1045,8 +1065,8 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
 
 fn draw(frame: &mut Frame, app: &RuntimeApp) {
     let area = frame.area();
-    let workspace = workspace_rect(area);
-    let status = status_rect(area);
+    let workspace = workspace_rect(area, app.compact_chrome);
+    let status = status_rect(area, app.compact_chrome);
 
     let tiled = tiled_panes(&app.session, workspace);
     if tiled.is_empty() && app.session.floating().is_empty() {
@@ -1085,7 +1105,9 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
         draw_help(frame, workspace);
     }
 
-    draw_statusline(frame, app, status);
+    if !app.compact_chrome {
+        draw_statusline(frame, app, status);
+    }
 }
 
 fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floating: bool) {
@@ -1104,25 +1126,27 @@ fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floati
     }
 
     let focused = app.session.focused() == Some(id);
-    let label_style = if focused {
-        Theme::label_focused()
-    } else {
-        Theme::label()
-    };
-    let prefix = if floating { " FLOAT " } else { " " };
-    let mut title = pane.title(spec);
-    if let Some(status) = pane.viewer_status() {
-        title = format!("{title}  {status}");
+    if !app.compact_chrome {
+        let label_style = if focused {
+            Theme::label_focused()
+        } else {
+            Theme::label()
+        };
+        let prefix = if floating { " FLOAT " } else { " " };
+        let mut title = pane.title(spec);
+        if let Some(status) = pane.viewer_status() {
+            title = format!("{title}  {status}");
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{prefix}{title}"),
+                label_style,
+            ))),
+            label_rect(area),
+        );
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{prefix}{title}"),
-            label_style,
-        ))),
-        label_rect(area),
-    );
 
-    let content = pane_content_rect(area);
+    let content = pane_content_rect(area, app.compact_chrome);
     if content.width > 0 && content.height > 0 {
         if let Some(screen) = pane.shell_screen() {
             let term = PseudoTerminal::new(screen)
@@ -1507,16 +1531,16 @@ fn tiled_panes(session: &Session, workspace: Rect) -> Vec<SolvedPane> {
         .unwrap_or_default()
 }
 
-fn pane_content_rects(session: &Session, area: Rect) -> BTreeMap<PaneId, Rect> {
-    let workspace = workspace_rect(area);
+fn pane_content_rects(session: &Session, area: Rect, compact: bool) -> BTreeMap<PaneId, Rect> {
+    let workspace = workspace_rect(area, compact);
     let mut rects = BTreeMap::new();
     for pane in tiled_panes(session, workspace) {
-        rects.insert(pane.id, pane_content_rect(pane.rect));
+        rects.insert(pane.id, pane_content_rect(pane.rect, compact));
     }
     if session.zoomed().is_none() {
         for (id, geom) in session.floating() {
             let rect = layout::resolve_float(*geom, workspace);
-            rects.insert(*id, pane_content_rect(rect));
+            rects.insert(*id, pane_content_rect(rect, compact));
         }
     }
     rects
@@ -1526,7 +1550,10 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
-fn workspace_rect(area: Rect) -> Rect {
+fn workspace_rect(area: Rect, compact: bool) -> Rect {
+    if compact {
+        return area;
+    }
     RatatuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -1537,7 +1564,10 @@ fn label_rect(area: Rect) -> Rect {
     Rect::new(area.x, area.y, area.width, area.height.min(1))
 }
 
-fn pane_content_rect(area: Rect) -> Rect {
+fn pane_content_rect(area: Rect, compact: bool) -> Rect {
+    if compact {
+        return area;
+    }
     Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -1546,7 +1576,10 @@ fn pane_content_rect(area: Rect) -> Rect {
     )
 }
 
-fn status_rect(area: Rect) -> Rect {
+fn status_rect(area: Rect, compact: bool) -> Rect {
+    if compact {
+        return Rect::new(area.x, area.bottom(), area.width, 0);
+    }
     RatatuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -1647,21 +1680,34 @@ mod tests {
     #[test]
     fn workspace_excludes_statusline() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(workspace_rect(area), Rect::new(0, 0, 80, 23));
-        assert_eq!(status_rect(area), Rect::new(0, 23, 80, 1));
+        assert_eq!(workspace_rect(area, false), Rect::new(0, 0, 80, 23));
+        assert_eq!(status_rect(area, false), Rect::new(0, 23, 80, 1));
+    }
+
+    #[test]
+    fn compact_chrome_reclaims_label_and_status_rows() {
+        let area = Rect::new(0, 0, 80, 24);
+        // Compact: workspace fills the frame and the statusline collapses to zero height.
+        assert_eq!(workspace_rect(area, true), area);
+        assert_eq!(status_rect(area, true).height, 0);
+        // Compact: a pane keeps its whole rect as content (no label row reserved).
+        let pane = Rect::new(2, 3, 40, 10);
+        assert_eq!(pane_content_rect(pane, true), pane);
+        // Normal mode still reserves exactly one row each, so the toggle is reversible.
+        assert_eq!(pane_content_rect(pane, false), Rect::new(2, 4, 40, 9));
     }
 
     #[test]
     fn pane_content_excludes_label() {
         let area = Rect::new(2, 3, 80, 24);
-        let content = pane_content_rect(area);
+        let content = pane_content_rect(area, false);
         assert_eq!(content, Rect::new(2, 4, 80, 23));
     }
 
     #[test]
     fn tiny_pane_still_has_valid_content_rect() {
         let area = Rect::new(0, 0, 12, 1);
-        let content = pane_content_rect(area);
+        let content = pane_content_rect(area, false);
         assert_eq!(content.height, 0);
         assert_eq!(content.width, 12);
     }

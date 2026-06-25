@@ -124,6 +124,12 @@ impl Shell {
         self.parser.screen()
     }
 
+    /// Plain-text contents of the visible screen, no formatting. Used to seed the
+    /// `$EDITOR` scratch buffer for the EditScrollback action.
+    pub(crate) fn screen_text(&self) -> String {
+        self.parser.screen().contents()
+    }
+
     pub(crate) fn mouse_protocol(&self) -> (MouseProtocolMode, MouseProtocolEncoding) {
         let screen = self.parser.screen();
         (

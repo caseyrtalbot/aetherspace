@@ -3,15 +3,15 @@
 use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ratatui::DefaultTerminal;
 use ratatui::crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::supports_keyboard_enhancement,
+    terminal::{EnterAlternateScreen, enable_raw_mode, supports_keyboard_enhancement},
 };
+use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
 
 static KEYBOARD_FLAGS_PUSHED: AtomicBool = AtomicBool::new(false);
 
@@ -36,6 +36,27 @@ impl TerminalGuard {
 
     pub(crate) fn terminal_mut(&mut self) -> &mut DefaultTerminal {
         &mut self.terminal
+    }
+
+    /// Re-acquire the alternate screen after a foreign full-screen program (an
+    /// `$EDITOR`) ran on the main screen. Pairs with a prior [`restore`].
+    ///
+    /// This re-runs only what `ratatui::init` does MINUS its panic hook: raw mode,
+    /// the alternate screen, and a fresh terminal backend. `ratatui::init` installs
+    /// a panic hook on every call, so calling it here would stack a new hook (and
+    /// leak the previous one) on every EditScrollback. The hook from `enter()` is
+    /// still installed and survives `restore`, so re-entry must avoid `init`. It
+    /// DOES re-enable mouse capture + bracketed paste (which the editor's restore
+    /// disabled, or which a SIGKILLed editor left in an unknown state) so the TUI
+    /// is usable on return.
+    pub(crate) fn reenter(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(stdout(), EnterAlternateScreen);
+        if let Ok(terminal) = Terminal::new(CrosstermBackend::new(stdout())) {
+            self.terminal = terminal;
+        }
+        enable_terminal_extras();
+        self.restored = false;
     }
 
     pub(crate) fn restore(&mut self) {

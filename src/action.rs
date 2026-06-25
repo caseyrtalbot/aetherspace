@@ -22,6 +22,7 @@ pub(crate) enum Action {
     OpenProjectPalette,
     OpenProjectViewer,
     OpenProjectShell,
+    EditScrollback,
     Noop,
 }
 

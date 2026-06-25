@@ -233,6 +233,7 @@ impl InputRouter {
             KeyCode::Char('p') | KeyCode::Char('P') => Action::OpenProjectPalette,
             KeyCode::Char('v') | KeyCode::Char('V') => Action::OpenProjectViewer,
             KeyCode::Char('s') | KeyCode::Char('S') => Action::OpenProjectShell,
+            KeyCode::Char('e') | KeyCode::Char('E') => Action::EditScrollback,
             KeyCode::Esc => Action::Render,
             _ if self.config.leader.matches(key) => Action::SendBytes(self.config.leader.bytes()),
             _ => Action::Render,
@@ -778,6 +779,12 @@ mod tests {
         assert_eq!(
             router.route_key(key(KeyCode::Char('s'))),
             Action::OpenProjectShell
+        );
+
+        assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('e'))),
+            Action::EditScrollback
         );
 
         assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,8 +12,7 @@ use ratatui::crossterm::event::{
     self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::{
-    Frame, Terminal,
-    backend::Backend,
+    Frame,
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::Style,
     text::{Line, Span, Text},
@@ -38,6 +38,17 @@ const FRAME: Duration = Duration::from_millis(16);
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 const MAX_EVENTS_PER_TURN: usize = 256;
+/// Poll cadence for the input thread. Long enough that idle CPU stays near zero
+/// (one wakeup every 200 ms), short enough that the editor-suspend flag is
+/// re-checked promptly. `event::poll` blocks efficiently until input or timeout.
+const INPUT_POLL: Duration = Duration::from_millis(200);
+
+/// Set while an `$EDITOR` owns the real terminal during EditScrollback. The input
+/// thread must not call `event::read` while this is set, or it would consume bytes
+/// meant for the editor. Module-level like `KEYBOARD_FLAGS_PUSHED` in `terminal`,
+/// since the producer (the editor spawn) and consumer (the input thread) are in
+/// different stack frames.
+static INPUT_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u32) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
@@ -87,7 +98,7 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
     spawn_input_thread(tx);
     status::spawn_status_thread(status_config, status_target, app.notify.clone());
 
-    let result = run_loop(guard.terminal_mut(), &mut app, rx);
+    let result = run_loop(&mut guard, &mut app, rx);
     session_store::save(&app.session);
     app.shutdown();
     result
@@ -130,6 +141,11 @@ struct RuntimeApp {
     /// Nesting depth this process is AT (0 = top-level). Drives the `nested:N`
     /// statusline span; the child env var is already incremented at boot.
     nest_depth: u32,
+    /// Set by `Action::EditScrollback` once the focused shell's screen has been
+    /// written to a temp file. Drained in `run_loop`, which is the only place the
+    /// `TerminalGuard` is reachable to restore/spawn-editor/reenter. Never set for
+    /// viewers or dead shells (those get a notice instead).
+    pending_editor: Option<PathBuf>,
 }
 
 struct RuntimeAppInit {
@@ -297,6 +313,7 @@ impl RuntimeApp {
             status: StatusSnapshot::default(),
             status_target: init.status_target,
             nest_depth: init.nest_depth,
+            pending_editor: None,
         })
     }
 
@@ -470,6 +487,36 @@ impl RuntimeApp {
         self.session_dirty = true;
         self.resize_to_area(self.last_area);
         Ok(())
+    }
+
+    /// Dump the focused shell's visible screen to a unique temp file and queue it
+    /// for `$EDITOR`. Viewers and non-running shells are a no-op-with-notice (per
+    /// the slice: never silently swallow the request). The actual editor spawn
+    /// happens in `run_loop`, where the `TerminalGuard` is reachable.
+    fn edit_scrollback(&mut self) {
+        let Some(id) = self.session.focused() else {
+            self.last_notice = Some("edit: no focused pane".to_string());
+            return;
+        };
+        let Some(pane) = self.panes.get(&id) else {
+            self.last_notice = Some("edit: no focused pane".to_string());
+            return;
+        };
+        if !pane.is_running() {
+            self.last_notice = Some("edit: focused pane is not a running shell".to_string());
+            return;
+        }
+        let Some(text) = pane.shell_screen_text() else {
+            self.last_notice = Some("edit: focused pane is not a running shell".to_string());
+            return;
+        };
+        let path = scrollback_temp_path(id);
+        if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+            self.last_error = Some(format!("edit: could not write scratch file: {e}"));
+            return;
+        }
+        self.last_error = None;
+        self.pending_editor = Some(path);
     }
 
     fn restart_focused(&mut self) -> Result<()> {
@@ -815,28 +862,42 @@ impl RuntimeApp {
 
 fn spawn_input_thread(tx: Sender<RuntimeEvent>) {
     thread::spawn(move || {
-        while let Ok(raw) = event::read() {
-            let Some(event) = RuntimeEvent::from_crossterm(raw) else {
+        loop {
+            // While an editor owns the terminal, do not touch stdin: poll/read
+            // would steal the editor's keystrokes. Sleep instead of polling so a
+            // ready-but-unconsumed stdin does not spin this loop.
+            if INPUT_SUSPENDED.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(20));
                 continue;
-            };
-            if tx.send(event).is_err() {
-                break;
+            }
+            match event::poll(INPUT_POLL) {
+                // Re-check suspension between poll and read: the editor may have
+                // taken over in that window, and we must leave the byte for it.
+                Ok(true) if !INPUT_SUSPENDED.load(Ordering::Acquire) => match event::read() {
+                    Ok(raw) => {
+                        if let Some(event) = RuntimeEvent::from_crossterm(raw)
+                            && tx.send(event).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(_) => continue,
+                Err(_) => break,
             }
         }
     });
 }
 
-fn run_loop<B: Backend>(
-    terminal: &mut Terminal<B>,
+fn run_loop(
+    guard: &mut TerminalGuard,
     app: &mut RuntimeApp,
     rx: Receiver<RuntimeEvent>,
-) -> Result<()>
-where
-    B::Error: std::error::Error + Send + Sync + 'static,
-{
-    let size = terminal.size()?;
+) -> Result<()> {
+    let size = guard.terminal_mut().size()?;
     app.resize_to_area(Rect::new(0, 0, size.width, size.height));
-    terminal.draw(|frame| draw(frame, app))?;
+    guard.terminal_mut().draw(|frame| draw(frame, app))?;
     let mut last_draw = Instant::now();
 
     while app.running {
@@ -854,12 +915,21 @@ where
             }
         }
 
+        // An EditScrollback action leaves a temp file queued. Run the editor here,
+        // the one place the TerminalGuard is reachable, then force a redraw so the
+        // TUI is repainted no matter how the editor exited.
+        if app.pending_editor.is_some() {
+            run_pending_editor(guard, app)?;
+            dirty = true;
+            last_draw = Instant::now();
+        }
+
         if dirty && app.running {
             let since = last_draw.elapsed();
             if since < FRAME {
                 thread::sleep(FRAME - since);
             }
-            terminal.draw(|frame| draw(frame, app))?;
+            guard.terminal_mut().draw(|frame| draw(frame, app))?;
             last_draw = Instant::now();
             // Reboot-durable autosave: persist layout+cwd after a session-mutating
             // action so a hard kill (kill -9) keeps the same state the clean-exit
@@ -872,6 +942,67 @@ where
         }
     }
     Ok(())
+}
+
+/// Drop out of the alternate screen, run `$EDITOR` on the queued scratch file,
+/// then re-enter and clear. The temp file is deleted inline once the editor
+/// returns. Recoverability is the priority here: whatever the editor did to the
+/// terminal (exited 0 after changing modes, or was SIGKILLed), `reenter` +
+/// `clear` restores a usable TUI with mouse capture and bracketed paste back on.
+fn run_pending_editor(guard: &mut TerminalGuard, app: &mut RuntimeApp) -> Result<()> {
+    let Some(path) = app.pending_editor.take() else {
+        return Ok(());
+    };
+    let editor = editor_command();
+
+    // Suspend the input thread before leaving raw mode so it cannot read stdin
+    // while the editor owns it; resume only after re-entry restores raw mode.
+    INPUT_SUSPENDED.store(true, Ordering::Release);
+    guard.restore();
+    let status = std::process::Command::new(&editor).arg(&path).status();
+    guard.reenter();
+    // Resume input before the fallible clear() so an error on that line cannot
+    // leave the input thread suspended (which would freeze all input).
+    INPUT_SUSPENDED.store(false, Ordering::Release);
+    guard.terminal_mut().clear()?;
+
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(_) => app.last_notice = Some(format!("edited screen with {editor}")),
+        Err(e) => app.last_error = Some(format!("editor {editor} failed: {e}")),
+    }
+    Ok(())
+}
+
+/// `$EDITOR`, then `$VISUAL`, then `vi`. Never panics on an unset variable; the
+/// fallback guarantees a launchable command.
+fn editor_command() -> String {
+    pick_editor(std::env::var("EDITOR").ok(), std::env::var("VISUAL").ok())
+}
+
+/// Pure core of [`editor_command`], split out so the fallback chain is testable
+/// without mutating process environment (which would race across test threads).
+/// Blank/whitespace values are treated as unset.
+fn pick_editor(editor: Option<String>, visual: Option<String>) -> String {
+    let non_blank = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    non_blank(editor)
+        .or_else(|| non_blank(visual))
+        .unwrap_or_else(|| "vi".to_string())
+}
+
+/// Unique scratch path for a pane's screen dump: pid + pane id keeps concurrent
+/// aetherspace instances and panes from colliding. Lives in the XDG runtime dir
+/// (falling back to the system temp dir when `XDG_RUNTIME_DIR` is unset).
+fn scrollback_temp_path(id: PaneId) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!(
+        "aetherspace-scrollback-{}-{}.txt",
+        std::process::id(),
+        id.0
+    ))
 }
 
 fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
@@ -1108,6 +1239,10 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             } else {
                 app.last_error = None;
             }
+            true
+        }
+        Action::EditScrollback => {
+            app.edit_scrollback();
             true
         }
         Action::Noop => dirty,
@@ -1744,6 +1879,35 @@ fn same_project_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_falls_back_through_visual_to_vi() {
+        assert_eq!(
+            pick_editor(Some("nvim".into()), Some("emacs".into())),
+            "nvim"
+        );
+        assert_eq!(pick_editor(None, Some("emacs".into())), "emacs");
+        assert_eq!(
+            pick_editor(Some("  ".into()), Some("emacs".into())),
+            "emacs"
+        );
+        assert_eq!(pick_editor(None, None), "vi");
+        assert_eq!(pick_editor(Some(String::new()), None), "vi");
+    }
+
+    #[test]
+    fn scrollback_temp_paths_are_unique_per_pane() {
+        let a = scrollback_temp_path(PaneId(0));
+        let b = scrollback_temp_path(PaneId(1));
+        assert_ne!(a, b);
+        assert!(a.is_absolute());
+        assert!(
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .ends_with("-0.txt")
+        );
+    }
 
     #[test]
     fn nest_segment_hidden_at_top_level_visible_when_nested() {

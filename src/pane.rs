@@ -102,6 +102,15 @@ impl PaneRuntime {
         }
     }
 
+    /// Plain-text visible screen of a shell pane, `None` for viewers. Feeds the
+    /// EditScrollback (`$EDITOR`) scratch buffer.
+    pub(crate) fn shell_screen_text(&self) -> Option<String> {
+        match self {
+            Self::Shell(shell) => Some(shell.screen_text()),
+            Self::Viewer(_) => None,
+        }
+    }
+
     pub(crate) fn title(&self, spec: &PaneSpec) -> String {
         match self {
             Self::Shell(shell) => shell.title(&spec.title),

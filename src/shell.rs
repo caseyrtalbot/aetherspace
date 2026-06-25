@@ -39,19 +39,13 @@ impl Shell {
         notify: Sender<RuntimeEvent>,
     ) -> Result<Self> {
         let (rows, cols) = normalize_size(rows, cols);
-        let generation = 0;
-        let process = PtyProcess::spawn(
-            PaneProcessId::new(pane_id, generation),
-            spec,
-            rows,
-            cols,
-            notify,
-        )?;
+        let id = PaneProcessId::for_spawn(pane_id);
+        let process = PtyProcess::spawn(id, spec, rows, cols, notify)?;
         Ok(Self {
             parser: vt100::Parser::new(rows, cols, scrollback),
             process: Some(process),
             pane_id,
-            generation,
+            generation: id.generation,
             rows,
             cols,
             scrollback,
@@ -67,10 +61,10 @@ impl Shell {
         notify: Sender<RuntimeEvent>,
     ) -> Result<()> {
         self.terminate();
-        self.generation += 1;
         self.pane_id = pane_id;
         self.scrollback = scrollback;
-        let id = self.current_process_id();
+        let id = PaneProcessId::for_spawn(pane_id);
+        self.generation = id.generation;
         let process = PtyProcess::spawn(id, spec, self.rows, self.cols, notify)?;
         self.parser = vt100::Parser::new(self.rows, self.cols, self.scrollback);
         self.process = Some(process);

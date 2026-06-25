@@ -1,9 +1,13 @@
 //! External events entering the runtime queue.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEvent};
 
 use crate::session::PaneId;
 use crate::status::StatusSnapshot;
+
+static NEXT_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneProcessId {
@@ -14,6 +18,11 @@ pub(crate) struct PaneProcessId {
 impl PaneProcessId {
     pub(crate) fn new(pane: PaneId, generation: u64) -> Self {
         Self { pane, generation }
+    }
+
+    pub(crate) fn for_spawn(pane: PaneId) -> Self {
+        let generation = NEXT_PROCESS_GENERATION.fetch_add(1, Ordering::Relaxed);
+        Self::new(pane, generation)
     }
 }
 
@@ -41,5 +50,18 @@ impl RuntimeEvent {
             CrosstermEvent::Resize(cols, rows) => Some(Self::Resize(cols, rows)),
             CrosstermEvent::FocusGained | CrosstermEvent::FocusLost => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_ids_for_reused_pane_ids_do_not_collide() {
+        let old_process = PaneProcessId::for_spawn(PaneId(1));
+        let replacement_process = PaneProcessId::for_spawn(PaneId(1));
+
+        assert_ne!(old_process, replacement_process);
     }
 }

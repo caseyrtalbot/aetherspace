@@ -402,7 +402,10 @@ impl Config {
     /// rest of the bindings survive: a single typo never wedges the keymap.
     fn resolve_keymap(&mut self) -> Option<String> {
         let mut map = keymap::default_keymap();
-        let warning = map.merge_overlay(&self.keymap.global, &self.keymap.leader);
+        // The configured leader's representative chord drives leader-collision
+        // detection: a [keymap].leader entry equal to it can never reach the keymap.
+        let leader_chord = keymap::leader_representative_chord(&self.input.leader);
+        let warning = map.merge_overlay(&self.keymap.global, &self.keymap.leader, leader_chord);
         self.resolved_keymap = map;
         warning
     }

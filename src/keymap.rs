@@ -221,25 +221,57 @@ impl Keymap {
     /// unknown key spelling or action name drops that entry with a warning;
     /// otherwise upsert, replacing any default binding for that chord (intended
     /// override, no warning). Returns the first one-line warning, if any.
+    ///
+    /// `leader_chord` is the configured `input.leader`'s representative [`Chord`]
+    /// (e.g. the default CtrlSpace → `Char(' ')`). A `[keymap].leader` entry whose
+    /// chord equals it is a LEADER COLLISION (decision 4b): that chord is consumed
+    /// by leader-mode entry and can never reach the keymap, so the entry is dropped
+    /// with a first-offender warning. Pass `None` to skip the collision check.
     pub(crate) fn merge_overlay(
         &mut self,
         global: &std::collections::BTreeMap<String, String>,
         leader: &std::collections::BTreeMap<String, String>,
+        leader_chord: Option<Chord>,
     ) -> Option<String> {
         let mut first_warning = None;
         merge_table(
             &mut self.global,
             global,
             ChordMode::Global,
+            None,
             &mut first_warning,
         );
         merge_table(
             &mut self.leader,
             leader,
             ChordMode::Leader,
+            leader_chord,
             &mut first_warning,
         );
         first_warning
+    }
+}
+
+/// Derive the configured leader's representative [`Chord`] for collision detection.
+/// Mirrors `input::Leader::from_name`: the CtrlSpace family normalizes to a literal
+/// `Char(' ')` (decision 13), `esc` to `Esc`, and any modified-char leader to its
+/// bare key code. The result is a `Chord::Leader` because the keymap leader table
+/// dispatches on code only. Returns `None` when the name does not parse (the leader
+/// itself falls back to CtrlSpace, but with no usable representative we skip the
+/// collision check rather than guess).
+pub(crate) fn leader_representative_chord(leader_name: &str) -> Option<Chord> {
+    let normalized = leader_name
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '+'], "-");
+    match normalized.as_str() {
+        "" | "ctrl-space" | "control-space" | "c-space" | "ctrl-@" | "control-@" => {
+            Some(Chord::Leader(KeyCode::Char(' ')))
+        }
+        _ => {
+            let (_, code) = parse_key_spelling(&normalized)?;
+            Some(Chord::Leader(code))
+        }
     }
 }
 
@@ -255,6 +287,7 @@ fn merge_table(
     table: &mut Vec<(Chord, Binding)>,
     overlay: &std::collections::BTreeMap<String, String>,
     mode: ChordMode,
+    leader_chord: Option<Chord>,
     first_warning: &mut Option<String>,
 ) {
     // Chords set by THIS overlay pass, to detect distinct spellings that normalize
@@ -265,6 +298,16 @@ fn merge_table(
             warn(first_warning, format!("keymap: unknown key '{spelling}'"));
             continue;
         };
+        // Leader collision (decision 4b): a [keymap].leader entry whose chord equals
+        // the configured input.leader can never reach the keymap (leader-mode entry
+        // intercepts it). Drop it and warn, before the action even matters.
+        if leader_chord == Some(chord) {
+            warn(
+                first_warning,
+                format!("keymap: leader binding '{spelling}' collides with the configured leader"),
+            );
+            continue;
+        }
         let Some(action) = BindAction::from_name(name) else {
             warn(
                 first_warning,
@@ -691,7 +734,7 @@ mod tests {
         let mut map = default_keymap();
         let mut leader = BTreeMap::new();
         leader.insert("x".to_string(), "quit".to_string());
-        let warning = map.merge_overlay(&BTreeMap::new(), &leader);
+        let warning = map.merge_overlay(&BTreeMap::new(), &leader, None);
         assert_eq!(warning, None);
         // 'x' now quits; the rest of the leader table is untouched.
         assert_eq!(
@@ -713,7 +756,7 @@ mod tests {
         let mut map = default_keymap();
         let mut leader = BTreeMap::new();
         leader.insert("x".to_string(), "frobnicate".to_string());
-        let warning = map.merge_overlay(&BTreeMap::new(), &leader).unwrap();
+        let warning = map.merge_overlay(&BTreeMap::new(), &leader, None).unwrap();
         assert!(warning.contains("frobnicate"), "{warning}");
         // 'x' keeps its default Close binding.
         assert_eq!(
@@ -727,14 +770,14 @@ mod tests {
         let mut map = default_keymap();
         let mut leader = BTreeMap::new();
         leader.insert("notakey".to_string(), "quit".to_string());
-        let warning = map.merge_overlay(&BTreeMap::new(), &leader).unwrap();
+        let warning = map.merge_overlay(&BTreeMap::new(), &leader, None).unwrap();
         assert!(warning.contains("notakey"), "{warning}");
     }
 
     #[test]
     fn default_keymap_overlay_with_no_entries_has_no_warning() {
         let mut map = default_keymap();
-        let warning = map.merge_overlay(&BTreeMap::new(), &BTreeMap::new());
+        let warning = map.merge_overlay(&BTreeMap::new(), &BTreeMap::new(), None);
         assert_eq!(warning, None);
     }
 
@@ -753,5 +796,72 @@ mod tests {
             parse_chord("f5", ChordMode::Global),
             Some(Chord::Global(KeyCode::F(5), KeyModifiers::NONE))
         );
+    }
+
+    #[test]
+    fn duplicate_chord_in_one_table_warns_and_names_chord() {
+        // `esc` and `escape` are distinct spellings that normalize to ONE Chord, so
+        // the second one in a single table is the residual in-table conflict (TOML
+        // rejects identical-string keys, never these distinct spellings).
+        let mut map = default_keymap();
+        let mut global = BTreeMap::new();
+        global.insert("esc".to_string(), "help".to_string());
+        global.insert("escape".to_string(), "quit".to_string());
+        let warning = map
+            .merge_overlay(&global, &BTreeMap::new(), None)
+            .expect("duplicate chord should warn");
+        assert!(warning.contains("duplicate"), "{warning}");
+        // BTreeMap orders "esc" before "escape": first wins, the duplicate drops.
+        assert_eq!(
+            map.lookup_global(false, ev(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(BindAction::Help)
+        );
+    }
+
+    #[test]
+    fn leader_override_colliding_with_configured_leader_warns() {
+        // Default leader CtrlSpace → representative Char(' ') (decision 13). A
+        // [keymap].leader "space"=... entry collides and is dropped with a warning.
+        let leader_chord = leader_representative_chord("ctrl-space");
+        assert_eq!(leader_chord, Some(Chord::Leader(KeyCode::Char(' '))));
+        let mut map = default_keymap();
+        let mut leader = BTreeMap::new();
+        leader.insert("space".to_string(), "quit".to_string());
+        let warning = map
+            .merge_overlay(&BTreeMap::new(), &leader, leader_chord)
+            .expect("leader collision should warn");
+        assert!(warning.contains("leader"), "{warning}");
+        // The colliding chord was dropped: Char(' ') is not bound to Quit.
+        assert_eq!(
+            map.lookup_leader(ev(KeyCode::Char(' '), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn valid_binding_alongside_conflicting_one_keeps_valid() {
+        // A leader-colliding entry drops, but a sibling valid override in the same
+        // pass still applies (a single conflict never wedges the rest of the table).
+        let leader_chord = leader_representative_chord("ctrl-space");
+        let mut map = default_keymap();
+        let mut leader = BTreeMap::new();
+        leader.insert("space".to_string(), "quit".to_string()); // collides → dropped
+        leader.insert("x".to_string(), "quit".to_string()); // valid override
+        let warning = map.merge_overlay(&BTreeMap::new(), &leader, leader_chord);
+        assert!(warning.is_some());
+        assert_eq!(
+            map.lookup_leader(ev(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(BindAction::Quit)
+        );
+    }
+
+    #[test]
+    fn default_keymap_has_no_conflicts() {
+        // An empty overlay against the default leader produces no warning: the
+        // built-in tables carry no in-table duplicate or leader collision.
+        let mut map = default_keymap();
+        let leader_chord = leader_representative_chord("ctrl-space");
+        let warning = map.merge_overlay(&BTreeMap::new(), &BTreeMap::new(), leader_chord);
+        assert_eq!(warning, None);
     }
 }

@@ -181,6 +181,11 @@ struct RuntimeApp {
     /// banner until the first keypress dismisses it. No timer exists, so it is
     /// keypress-cleared only (see `handle_key`).
     config_warning: Option<String>,
+    /// Reserved-row banner painted at the top of the frame independent of the
+    /// statusline, so a config/keybind warning survives compact mode. Reserves one
+    /// row of the workspace (shrinking the PTY winsize) while `Some`. Set at boot
+    /// alongside `config_warning` and cleared together on first keypress.
+    banner: Option<Banner>,
     /// Set ONLY by the discrete session-mutating actions (split/close/restart/
     /// focus/resize/zoom/float, project select, open shell/viewer, reset). Drives
     /// the reboot-durable autosave in `run_loop`. NEVER set on SendBytes/Pty/
@@ -257,6 +262,26 @@ enum PaletteCommand {
 enum StatusTone {
     Normal,
     Notice,
+    Error,
+}
+
+/// A reserved-row banner, painted at the top of the frame INDEPENDENT of the
+/// statusline so a config/keybind warning stays visible in compact mode (where the
+/// statusline collapses to zero height). The reserved row shrinks the PTY winsize,
+/// so it must flow through the geometry callers, not just `draw`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Banner {
+    text: String,
+    tone: BannerTone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BannerTone {
+    /// A keybind/config conflict surfaced at load or reload.
+    Conflict,
+    /// A hard error (e.g. a vanished config file on reload). Constructed by the C3
+    /// reload path; defined here so the banner model is complete in C2.
+    #[allow(dead_code)]
     Error,
 }
 
@@ -376,6 +401,13 @@ impl RuntimeApp {
             notify: init.notify,
             last_error: None,
             last_notice: None,
+            // Route the boot warning into BOTH sinks: config_warning preserves the
+            // A2 statusline behavior; the banner makes it visible in compact too.
+            // First keypress clears both together (one dismissal policy).
+            banner: init.config_warning.as_ref().map(|text| Banner {
+                text: text.clone(),
+                tone: BannerTone::Conflict,
+            }),
             config_warning: init.config_warning,
             session_dirty: false,
             session_persist: init.session_persist,
@@ -392,9 +424,17 @@ impl RuntimeApp {
         }
     }
 
+    /// Rows the reserved-row banner currently occupies (1 while a banner is set, 0
+    /// otherwise). Threaded into every geometry caller so the banner shrinks the
+    /// workspace AND the PTY winsize, never just the painted frame.
+    fn banner_rows(&self) -> u16 {
+        self.banner.is_some() as u16
+    }
+
     fn resize_to_area(&mut self, area: Rect) {
         self.last_area = area;
-        let content_rects = pane_content_rects(&self.session, area, self.compact_chrome);
+        let content_rects =
+            pane_content_rects(&self.session, area, self.banner_rows(), self.compact_chrome);
         for (id, pane) in &mut self.panes {
             if let Some(content) = content_rects.get(id) {
                 pane.resize(content.height, content.width);
@@ -436,14 +476,24 @@ impl RuntimeApp {
         let Some(id) = self.session.focused() else {
             return INITIAL_ROWS;
         };
-        pane_content_rects(&self.session, self.last_area, self.compact_chrome)
-            .get(&id)
-            .map(|rect| rect.height)
-            .unwrap_or(INITIAL_ROWS)
+        pane_content_rects(
+            &self.session,
+            self.last_area,
+            self.banner_rows(),
+            self.compact_chrome,
+        )
+        .get(&id)
+        .map(|rect| rect.height)
+        .unwrap_or(INITIAL_ROWS)
     }
 
     fn spawn_runtime_for_spec(&mut self, spec: PaneSpec) -> Result<()> {
-        let content_rects = pane_content_rects(&self.session, self.last_area, self.compact_chrome);
+        let content_rects = pane_content_rects(
+            &self.session,
+            self.last_area,
+            self.banner_rows(),
+            self.compact_chrome,
+        );
         let content = content_rects.get(&spec.id).copied().unwrap_or(Rect::new(
             0,
             0,
@@ -721,7 +771,11 @@ impl RuntimeApp {
     }
 
     fn toggle_float_focused(&mut self) {
-        let geom = FloatGeom::centered(workspace_rect(self.last_area, self.compact_chrome));
+        let geom = FloatGeom::centered(workspace_rect(
+            self.last_area,
+            self.banner_rows(),
+            self.compact_chrome,
+        ));
         if self.session.toggle_float_focused(geom) {
             self.resize_to_area(self.last_area);
         }
@@ -800,8 +854,13 @@ impl RuntimeApp {
 
     fn focused_mouse_content_rect(&self, mouse: MouseEvent) -> Option<(PaneId, Rect)> {
         let id = self.session.focused()?;
-        let content =
-            *pane_content_rects(&self.session, self.last_area, self.compact_chrome).get(&id)?;
+        let content = *pane_content_rects(
+            &self.session,
+            self.last_area,
+            self.banner_rows(),
+            self.compact_chrome,
+        )
+        .get(&id)?;
         if rect_contains(content, mouse.column, mouse.row) {
             Some((id, content))
         } else {
@@ -830,7 +889,7 @@ impl RuntimeApp {
     }
 
     fn pane_at(&self, column: u16, row: u16) -> Option<PaneId> {
-        let workspace = workspace_rect(self.last_area, self.compact_chrome);
+        let workspace = workspace_rect(self.last_area, self.banner_rows(), self.compact_chrome);
         if self.session.zoomed().is_none() {
             for (id, geom) in self.session.floating().iter().rev() {
                 let rect = layout::resolve_float(*geom, workspace);
@@ -1210,13 +1269,22 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
 }
 
 fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
-    // First real keypress dismisses the config-warning banner. No timer exists,
-    // so this is the only way it clears; force a redraw so it actually vanishes
-    // (the blocked loop redraws only when the triggering key is dirty).
-    let cleared_warning = key.kind != KeyEventKind::Release && app.config_warning.take().is_some();
+    // First real keypress dismisses BOTH the config_warning (statusline sink) and the
+    // reserved-row banner together — one dismissal policy, no split-brain. No timer
+    // exists, so this is the only way they clear; force a redraw so they actually
+    // vanish (the blocked loop redraws only when the triggering key is dirty).
+    let real = key.kind != KeyEventKind::Release;
+    let cleared_warning = real && app.config_warning.take().is_some();
+    let cleared_banner = real && app.banner.take().is_some();
+    // Clearing the banner frees its reserved row; resize so the child PTY winsize
+    // reclaims it immediately (otherwise the child renders short until the next
+    // terminal resize event).
+    if cleared_banner {
+        app.resize_to_area(app.last_area);
+    }
     // OR the dismissal in so the banner vanishes even when the key was otherwise
     // a no-op for rendering.
-    dispatch_key(app, key) || cleared_warning
+    dispatch_key(app, key) || cleared_warning || cleared_banner
 }
 
 fn dispatch_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
@@ -1379,8 +1447,10 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
 
 fn draw(frame: &mut Frame, app: &RuntimeApp) {
     let area = frame.area();
-    let workspace = workspace_rect(area, app.compact_chrome);
-    let status = status_rect(area, app.compact_chrome);
+    let banner_rows = app.banner_rows();
+    let banner = banner_rect(area, banner_rows, app.compact_chrome);
+    let workspace = workspace_rect(area, banner_rows, app.compact_chrome);
+    let status = status_rect(area, banner_rows, app.compact_chrome);
 
     let tiled = tiled_panes(&app.session, workspace);
     if tiled.is_empty() && app.session.floating().is_empty() {
@@ -1434,6 +1504,32 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
     if !app.compact_chrome {
         draw_statusline(frame, app, status);
     }
+
+    // Paint the banner UNCONDITIONALLY (outside the compact guard) so a config /
+    // keybind warning stays visible after the statusline collapses.
+    if let Some(b) = &app.banner {
+        draw_banner(frame, b, banner);
+    }
+}
+
+/// Paint the reserved-row banner. Tone picks a legible Theme color: a conflict reads
+/// as a warning, a hard error as an accent.
+fn draw_banner(frame: &mut Frame, banner: &Banner, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let fg = match banner.tone {
+        BannerTone::Conflict => Theme::GLOW_AMBER,
+        BannerTone::Error => Theme::ACCENT,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", banner.text),
+            Style::default().fg(fg),
+        )))
+        .style(Style::default().bg(Theme::SELECT_BG)),
+        area,
+    );
 }
 
 fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floating: bool) {
@@ -2043,8 +2139,13 @@ fn tiled_panes(session: &Session, workspace: Rect) -> Vec<SolvedPane> {
         .unwrap_or_default()
 }
 
-fn pane_content_rects(session: &Session, area: Rect, compact: bool) -> BTreeMap<PaneId, Rect> {
-    let workspace = workspace_rect(area, compact);
+fn pane_content_rects(
+    session: &Session,
+    area: Rect,
+    banner_rows: u16,
+    compact: bool,
+) -> BTreeMap<PaneId, Rect> {
+    let workspace = workspace_rect(area, banner_rows, compact);
     let mut rects = BTreeMap::new();
     for pane in tiled_panes(session, workspace) {
         rects.insert(pane.id, pane_content_rect(pane.rect, compact));
@@ -2062,14 +2163,31 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
-fn workspace_rect(area: Rect, compact: bool) -> Rect {
-    if compact {
-        return area;
-    }
-    RatatuiLayout::default()
+/// Split the frame into `[banner, workspace, status]` from ONE layout pass so the
+/// three rects cannot overlap or gap. `banner_rows` reserves the top reserved-row
+/// banner (0 when absent); `compact` collapses the statusline to zero height. This
+/// is the single source of chrome geometry: `banner_rect`/`workspace_rect`/
+/// `status_rect` are thin wrappers, and the banner row subtracted HERE flows into
+/// `pane_content_rects`→`pane.resize`, so the PTY winsize shrinks (the A1 lesson).
+fn chrome_split(area: Rect, banner_rows: u16, compact: bool) -> [Rect; 3] {
+    let status_rows = if compact { 0 } else { 1 };
+    let chunks = RatatuiLayout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area)[0]
+        .constraints([
+            Constraint::Length(banner_rows),
+            Constraint::Min(0),
+            Constraint::Length(status_rows),
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
+fn banner_rect(area: Rect, banner_rows: u16, compact: bool) -> Rect {
+    chrome_split(area, banner_rows, compact)[0]
+}
+
+fn workspace_rect(area: Rect, banner_rows: u16, compact: bool) -> Rect {
+    chrome_split(area, banner_rows, compact)[1]
 }
 
 fn label_rect(area: Rect) -> Rect {
@@ -2088,14 +2206,8 @@ fn pane_content_rect(area: Rect, compact: bool) -> Rect {
     )
 }
 
-fn status_rect(area: Rect, compact: bool) -> Rect {
-    if compact {
-        return Rect::new(area.x, area.bottom(), area.width, 0);
-    }
-    RatatuiLayout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area)[1]
+fn status_rect(area: Rect, banner_rows: u16, compact: bool) -> Rect {
+    chrome_split(area, banner_rows, compact)[2]
 }
 
 fn select_start_project(
@@ -2294,21 +2406,106 @@ mod tests {
     #[test]
     fn workspace_excludes_statusline() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(workspace_rect(area, false), Rect::new(0, 0, 80, 23));
-        assert_eq!(status_rect(area, false), Rect::new(0, 23, 80, 1));
+        // No banner (banner_rows = 0): workspace excludes only the status row.
+        assert_eq!(workspace_rect(area, 0, false), Rect::new(0, 0, 80, 23));
+        assert_eq!(status_rect(area, 0, false), Rect::new(0, 23, 80, 1));
+        assert_eq!(banner_rect(area, 0, false), Rect::new(0, 0, 80, 0));
     }
 
     #[test]
     fn compact_chrome_reclaims_label_and_status_rows() {
         let area = Rect::new(0, 0, 80, 24);
-        // Compact: workspace fills the frame and the statusline collapses to zero height.
-        assert_eq!(workspace_rect(area, true), area);
-        assert_eq!(status_rect(area, true).height, 0);
+        // Compact, no banner: workspace fills the frame and the statusline collapses.
+        assert_eq!(workspace_rect(area, 0, true), area);
+        assert_eq!(status_rect(area, 0, true).height, 0);
         // Compact: a pane keeps its whole rect as content (no label row reserved).
         let pane = Rect::new(2, 3, 40, 10);
         assert_eq!(pane_content_rect(pane, true), pane);
         // Normal mode still reserves exactly one row each, so the toggle is reversible.
         assert_eq!(pane_content_rect(pane, false), Rect::new(2, 4, 40, 9));
+    }
+
+    #[test]
+    fn workspace_rect_reserves_banner_row_when_present() {
+        let area = Rect::new(0, 0, 80, 24);
+        // NORMAL: banner steals the top row, status the bottom — workspace shrinks
+        // by one more row than the no-banner case (23 → 22).
+        assert_eq!(banner_rect(area, 1, false), Rect::new(0, 0, 80, 1));
+        assert_eq!(workspace_rect(area, 1, false), Rect::new(0, 1, 80, 22));
+        assert_eq!(status_rect(area, 1, false), Rect::new(0, 23, 80, 1));
+        // COMPACT: statusline is gone, but the banner row STILL reserves (24 → 23),
+        // which is the compact-proof guarantee.
+        assert_eq!(banner_rect(area, 1, true), Rect::new(0, 0, 80, 1));
+        assert_eq!(workspace_rect(area, 1, true), Rect::new(0, 1, 80, 23));
+        assert_eq!(status_rect(area, 1, true).height, 0);
+    }
+
+    #[test]
+    fn chrome_split_chunks_tile_without_overlap() {
+        let area = Rect::new(0, 0, 80, 24);
+        for (banner_rows, compact) in [(0, false), (1, false), (0, true), (1, true)] {
+            let [banner, workspace, status] = chrome_split(area, banner_rows, compact);
+            // The three chunks tile the whole frame top-to-bottom with no gap/overlap.
+            assert_eq!(banner.y, area.y);
+            assert_eq!(workspace.y, banner.bottom());
+            assert_eq!(status.y, workspace.bottom());
+            assert_eq!(status.bottom(), area.bottom());
+            assert_eq!(
+                banner.height + workspace.height + status.height,
+                area.height
+            );
+        }
+    }
+
+    #[test]
+    fn pane_content_rects_shrink_when_banner_present() {
+        // A single full-screen tiled pane: the content rect (the PTY winsize source)
+        // loses one row when the banner reserves its row. Pure geometry, no PTY.
+        let session = Session::single_shell(PathBuf::from("/work/x"));
+        let area = Rect::new(0, 0, 80, 24);
+        let id = session.focused().expect("a focused pane");
+        let without = pane_content_rects(&session, area, 0, false)[&id].height;
+        let with = pane_content_rects(&session, area, 1, false)[&id].height;
+        assert_eq!(with, without - 1, "banner row must shrink the winsize");
+    }
+
+    #[test]
+    fn stack_chip_click_resolves_to_member_through_banner_aware_workspace() {
+        use crate::layout::{self, TileNode};
+        // A root Stack of three members. Chip rects are computed THROUGH the same
+        // banner-aware workspace rect the live hit-test uses, so a banner row offsets
+        // the strip and a synthetic click still lands on the intended member's chip.
+        let tree = TileNode::Stack {
+            children: vec![
+                TileNode::Leaf(PaneId(10)),
+                TileNode::Leaf(PaneId(11)),
+                TileNode::Leaf(PaneId(12)),
+            ],
+            active: 0,
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        // Banner present (1 row): the workspace — and thus the chip strip — shifts down.
+        let workspace = workspace_rect(area, 1, false);
+        assert_eq!(workspace.y, 1, "banner reserves the top row");
+        let chips = layout::stack_chips(&tree, workspace);
+        assert_eq!(chips.len(), 3);
+
+        // Mirror pane_at's chip branch: a click inside a chip rect resolves to its id.
+        let resolve = |column: u16, row: u16| -> Option<PaneId> {
+            layout::stack_chips(&tree, workspace)
+                .into_iter()
+                .find(|chip| rect_contains(chip.rect, column, row))
+                .map(|chip| chip.id)
+        };
+
+        for (i, want) in [PaneId(10), PaneId(11), PaneId(12)].into_iter().enumerate() {
+            let chip = chips[i].rect;
+            // Click the chip's center; the strip rides the banner-shifted workspace.
+            let column = chip.x + chip.width / 2;
+            let row = chip.y;
+            assert!(row >= workspace.y, "chip strip sits inside the workspace");
+            assert_eq!(resolve(column, row), Some(want), "chip {i}");
+        }
     }
 
     #[test]

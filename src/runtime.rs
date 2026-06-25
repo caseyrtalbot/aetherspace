@@ -39,7 +39,7 @@ const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 const MAX_EVENTS_PER_TURN: usize = 256;
 
-pub(crate) fn run(config: Config, config_warning: Option<String>) -> Result<()> {
+pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u32) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let projects = config.resolve_projects();
@@ -58,6 +58,7 @@ pub(crate) fn run(config: Config, config_warning: Option<String>) -> Result<()> 
         default_viewer: config.workflow.default_viewer.clone(),
         status_target: status_target.clone(),
         config_warning: config_warning.clone(),
+        nest_depth,
     }) {
         Ok(app) => app,
         Err(e) if restored_session => {
@@ -75,6 +76,7 @@ pub(crate) fn run(config: Config, config_warning: Option<String>) -> Result<()> 
                 default_viewer: config.workflow.default_viewer,
                 status_target: status_target.clone(),
                 config_warning,
+                nest_depth,
             })?
         }
         Err(e) => return Err(e),
@@ -120,6 +122,9 @@ struct RuntimeApp {
     config_warning: Option<String>,
     status: StatusSnapshot,
     status_target: StatusTarget,
+    /// Nesting depth this process is AT (0 = top-level). Drives the `nested:N`
+    /// statusline span; the child env var is already incremented at boot.
+    nest_depth: u32,
 }
 
 struct RuntimeAppInit {
@@ -132,6 +137,7 @@ struct RuntimeAppInit {
     default_viewer: PathBuf,
     status_target: StatusTarget,
     config_warning: Option<String>,
+    nest_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +290,7 @@ impl RuntimeApp {
             config_warning: init.config_warning,
             status: StatusSnapshot::default(),
             status_target: init.status_target,
+            nest_depth: init.nest_depth,
         })
     }
 
@@ -1366,13 +1373,19 @@ fn draw_statusline(frame: &mut Frame, app: &RuntimeApp, area: Rect) {
         Span::styled(" Aetherspace ", Theme::status_title()),
         sep(),
         Span::styled("v0.1 tui ", Theme::status_meta()),
+    ];
+    if let Some(nested) = nest_segment(app.nest_depth) {
+        spans.push(sep());
+        spans.push(Span::styled(nested, Theme::status_notice()));
+    }
+    spans.extend([
         sep(),
         Span::styled(format!("project:{project} "), Theme::status_meta()),
         sep(),
         Span::styled(format!("{pane_state} "), Theme::status_meta()),
         sep(),
         Span::styled(format!("{leader}:{mode} "), Theme::status_meta()),
-    ];
+    ]);
 
     if let Some(status) = status::status_segment(&app.status) {
         spans.push(sep());
@@ -1467,6 +1480,12 @@ fn pane_state(app: &RuntimeApp) -> String {
         "tile"
     };
     format!("panes:{} {surface}:{focus_kind}", app.panes.len())
+}
+
+/// `nested:N` indicator shown only when running inside another aetherspace
+/// pane. Depth 0 (top-level) renders nothing.
+fn nest_segment(depth: u32) -> Option<String> {
+    (depth >= 1).then(|| format!("nested:{depth} "))
 }
 
 fn status_project_budget(width: u16) -> u16 {
@@ -1699,6 +1718,13 @@ fn same_project_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nest_segment_hidden_at_top_level_visible_when_nested() {
+        assert_eq!(nest_segment(0), None);
+        assert_eq!(nest_segment(1).as_deref(), Some("nested:1 "));
+        assert_eq!(nest_segment(3).as_deref(), Some("nested:3 "));
+    }
 
     #[test]
     fn workspace_excludes_statusline() {

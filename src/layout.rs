@@ -109,6 +109,19 @@ pub(crate) struct SepLine {
     pub(crate) horizontal: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitPathStep {
+    A,
+    B,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitHit {
+    pub(crate) path: Vec<SplitPathStep>,
+    pub(crate) dir: SplitDir,
+    pub(crate) area: Rect,
+}
+
 pub(crate) fn separators(node: &TileNode, area: Rect) -> Vec<SepLine> {
     let mut out = Vec::new();
     separators_into(node, area, &mut out);
@@ -136,6 +149,100 @@ fn separators_into(node: &TileNode, area: Rect, out: &mut Vec<SepLine>) {
             }
         }
     }
+}
+
+pub(crate) fn split_hit(node: &TileNode, area: Rect, column: u16, row: u16) -> Option<SplitHit> {
+    let mut path = Vec::new();
+    split_hit_into(node, area, column, row, &mut path)
+}
+
+fn split_hit_into(
+    node: &TileNode,
+    area: Rect,
+    column: u16,
+    row: u16,
+    path: &mut Vec<SplitPathStep>,
+) -> Option<SplitHit> {
+    match node {
+        TileNode::Leaf(_) => None,
+        TileNode::Split { dir, ratio, a, b } => {
+            let (ra, sep, rb) = split_rects(*dir, *ratio, area);
+            if contains_point(sep, column, row) {
+                return Some(SplitHit {
+                    path: path.clone(),
+                    dir: *dir,
+                    area,
+                });
+            }
+            path.push(SplitPathStep::A);
+            if let Some(hit) = split_hit_into(a, ra, column, row, path) {
+                path.pop();
+                return Some(hit);
+            }
+            path.pop();
+
+            path.push(SplitPathStep::B);
+            let hit = split_hit_into(b, rb, column, row, path);
+            path.pop();
+            hit
+        }
+        TileNode::Stack { children, active } => children
+            .get(*active)
+            .and_then(|child| split_hit_into(child, stack_body_rect(area), column, row, path)),
+    }
+}
+
+pub(crate) fn drag_ratio(hit: &SplitHit, column: u16, row: u16) -> u16 {
+    match hit.dir {
+        SplitDir::Horizontal => ratio_from_axis(column, hit.area.x, hit.area.width),
+        SplitDir::Vertical => ratio_from_axis(row, hit.area.y, hit.area.height),
+    }
+}
+
+fn ratio_from_axis(pos: u16, start: u16, span: u16) -> u16 {
+    if span <= 1 {
+        return 50;
+    }
+    let relative = pos.saturating_sub(start).min(span.saturating_sub(1));
+    ((u32::from(relative) * 100) / u32::from(span)).clamp(1, 99) as u16
+}
+
+pub(crate) fn set_split_ratio(node: &mut TileNode, path: &[SplitPathStep], ratio: u16) -> bool {
+    match path.split_first() {
+        None => match node {
+            TileNode::Split { ratio: slot, .. } => {
+                let next = ratio.clamp(1, 99);
+                if *slot == next {
+                    false
+                } else {
+                    *slot = next;
+                    true
+                }
+            }
+            TileNode::Stack { children, active } => children
+                .get_mut(*active)
+                .is_some_and(|child| set_split_ratio(child, path, ratio)),
+            TileNode::Leaf(_) => false,
+        },
+        Some((SplitPathStep::A, rest)) => match node {
+            TileNode::Split { a, .. } => set_split_ratio(a, rest, ratio),
+            TileNode::Stack { children, active } => children
+                .get_mut(*active)
+                .is_some_and(|child| set_split_ratio(child, path, ratio)),
+            TileNode::Leaf(_) => false,
+        },
+        Some((SplitPathStep::B, rest)) => match node {
+            TileNode::Split { b, .. } => set_split_ratio(b, rest, ratio),
+            TileNode::Stack { children, active } => children
+                .get_mut(*active)
+                .is_some_and(|child| set_split_ratio(child, path, ratio)),
+            TileNode::Leaf(_) => false,
+        },
+    }
+}
+
+fn contains_point(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
 fn split_rects(dir: SplitDir, ratio: u16, area: Rect) -> (Rect, Rect, Rect) {
@@ -650,6 +757,47 @@ mod tests {
         let seps = separators(&two_leaf(), area);
         assert_eq!(seps.len(), 1);
         assert!(seps[0].horizontal);
+    }
+
+    #[test]
+    fn split_hit_resizes_the_target_split() {
+        let area = Rect::new(0, 0, 80, 40);
+        let mut tree = two_leaf();
+        let sep = separators(&tree, area)[0].rect;
+        let hit = split_hit(&tree, area, sep.x, sep.y).expect("separator hit");
+        assert_eq!(hit.path, Vec::<SplitPathStep>::new());
+        assert_eq!(hit.dir, SplitDir::Vertical);
+        assert!(set_split_ratio(&mut tree, &hit.path, 70));
+        let TileNode::Split { ratio, .. } = tree else {
+            panic!("expected split");
+        };
+        assert_eq!(ratio, 70);
+    }
+
+    #[test]
+    fn split_hit_inside_active_stack_member_resizes_through_the_stack() {
+        let area = Rect::new(0, 0, 80, 40);
+        let active_split = TileNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 50,
+            a: Box::new(TileNode::Leaf(PaneId(1))),
+            b: Box::new(TileNode::Leaf(PaneId(2))),
+        };
+        let mut tree = TileNode::Stack {
+            children: vec![TileNode::Leaf(PaneId(0)), active_split],
+            active: 1,
+        };
+        let sep = separators(&tree, area)[0].rect;
+        let hit = split_hit(&tree, area, sep.x, sep.y).expect("nested separator hit");
+        assert_eq!(hit.path, Vec::<SplitPathStep>::new());
+        assert!(set_split_ratio(&mut tree, &hit.path, 65));
+        let TileNode::Stack { children, active } = tree else {
+            panic!("expected stack");
+        };
+        let TileNode::Split { ratio, .. } = &children[active] else {
+            panic!("expected active split");
+        };
+        assert_eq!(*ratio, 65);
     }
 
     #[test]

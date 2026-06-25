@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::{
-    CloseOutcome, FloatGeom, SplitDir, TileNode, clamp_active, close_leaf, contains_leaf,
-    dock_leaf, leaves, nudge_ratio, set_active_for_leaf, split_leaf, toggle_stack,
+    CloseOutcome, FloatGeom, SplitDir, SplitHit, TileNode, clamp_active, close_leaf, contains_leaf,
+    dock_leaf, drag_ratio, leaves, nudge_ratio, set_active_for_leaf, set_split_ratio, split_hit,
+    split_leaf, toggle_stack,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -192,6 +193,27 @@ impl Session {
         nudge_ratio(tree, id, delta)
     }
 
+    pub(crate) fn split_hit_at(
+        &self,
+        area: ratatui::layout::Rect,
+        column: u16,
+        row: u16,
+    ) -> Option<SplitHit> {
+        if self.zoomed.is_some() {
+            return None;
+        }
+        self.tiled
+            .as_ref()
+            .and_then(|tree| split_hit(tree, area, column, row))
+    }
+
+    pub(crate) fn resize_split_at(&mut self, hit: &SplitHit, column: u16, row: u16) -> bool {
+        let Some(tree) = self.tiled.as_mut() else {
+            return false;
+        };
+        set_split_ratio(tree, &hit.path, drag_ratio(hit, column, row))
+    }
+
     pub(crate) fn toggle_zoom_focused(&mut self) -> bool {
         let Some(id) = self.focused else {
             return false;
@@ -252,6 +274,30 @@ impl Session {
         self.floating.insert(id, geom);
         self.focused = Some(id);
         self.zoomed = None;
+        true
+    }
+
+    pub(crate) fn move_floating_to(
+        &mut self,
+        id: PaneId,
+        x: u16,
+        y: u16,
+        area: ratatui::layout::Rect,
+    ) -> bool {
+        let Some(geom) = self.floating.get_mut(&id) else {
+            return false;
+        };
+        let width = geom.width.max(1).min(area.width);
+        let height = geom.height.max(1).min(area.height);
+        let max_x = area.right().saturating_sub(width);
+        let max_y = area.bottom().saturating_sub(height);
+        let next_x = x.clamp(area.x, max_x);
+        let next_y = y.clamp(area.y, max_y);
+        if geom.x == next_x && geom.y == next_y {
+            return false;
+        }
+        geom.x = next_x;
+        geom.y = next_y;
         true
     }
 
@@ -521,6 +567,36 @@ mod tests {
             session.tiled().map(leaves),
             Some(vec![PaneId(0), PaneId(1)])
         );
+    }
+
+    #[test]
+    fn moving_floating_pane_clamps_inside_workspace() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        let floated = session.focused().expect("focused");
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 4,
+            y: 3,
+            width: 20,
+            height: 10,
+        }));
+        assert!(session.move_floating_to(
+            floated,
+            200,
+            200,
+            ratatui::layout::Rect::new(0, 0, 100, 40)
+        ));
+        let geom = session.floating()[&floated];
+        assert_eq!(geom.x, 80);
+        assert_eq!(geom.y, 30);
+        assert!(!session.move_floating_to(
+            PaneId(99),
+            1,
+            1,
+            ratatui::layout::Rect::new(0, 0, 100, 40)
+        ));
     }
 
     #[test]

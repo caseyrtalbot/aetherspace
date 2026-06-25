@@ -675,6 +675,31 @@ mod tests {
     }
 
     #[test]
+    fn f_key_actions_have_non_fkey_leader_routes() {
+        let map = default_keymap();
+        let cases = [
+            (KeyCode::Char('h'), BindAction::Help),
+            (KeyCode::Char('c'), BindAction::CommandPalette),
+            (KeyCode::Char('p'), BindAction::ProjectPalette),
+            (KeyCode::Char('v'), BindAction::Viewer),
+            (KeyCode::Char('s'), BindAction::Shell),
+            (KeyCode::Tab, BindAction::FocusNext),
+            (KeyCode::BackTab, BindAction::FocusPrev),
+            (KeyCode::Char('z'), BindAction::Zoom),
+            (KeyCode::Char('x'), BindAction::Close),
+            (KeyCode::Char('q'), BindAction::Quit),
+            (KeyCode::Char('g'), BindAction::ReloadConfig),
+        ];
+        for (code, action) in cases {
+            assert_eq!(
+                map.lookup_leader(ev(code, KeyModifiers::NONE)),
+                Some(action),
+                "{action:?} should not require an F-key"
+            );
+        }
+    }
+
+    #[test]
     fn global_lookup_is_shell_safe() {
         let map = default_keymap();
         let none = KeyModifiers::NONE;

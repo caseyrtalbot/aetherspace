@@ -46,7 +46,7 @@ scrollback = 10000  # lines of PTY scrollback retained
 
 # Input settings.
 [input]
-leader = "ctrl-space"  # accepts ctrl-space, ctrl-@, ctrl-g, alt-g, esc
+leader = "ctrl-space"  # accepts ctrl-space, ctrl-@, alt-space, ctrl-g, alt-g, esc
 
 # Keymap overrides (sparse). Two tables mirror the two dispatch surfaces:
 #   [keymap.global]  always-on shortcuts, matched on the EXACT chord (with

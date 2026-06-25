@@ -65,19 +65,23 @@ The easiest controls keep normal shell keys intact:
 | --- | --- |
 | `Ctrl+Enter` or `Alt+Enter` | Command palette |
 | `Ctrl+/` or `Alt+/` | Help |
+| `Ctrl+Space` or `Alt+Space` | Leader prefix |
 | Click pane | Focus pane |
 | `Ctrl+Tab` | Focus next pane, if your terminal sends it |
 | `Shift+Tab` | Focus previous pane in viewer panes |
 
 Click a pane to focus it unless the focused child shell app has enabled mouse
 capture. The command palette also includes `reset workspace`, which collapses a
-cluttered restored session back to one selected-project shell.
+cluttered restored session back to one selected-project shell. Type in command,
+project, and layout palettes to filter the list; use arrows or Tab to move
+selection, then Enter to run.
 
 Function keys remain as a fallback: `F1` help, `F2` commands, `F3` projects,
 `F4` viewer, `F5` shell, `F6/F7` focus, `F8` zoom, `F9` close, and `F10` quit.
 
-Default leader: `Ctrl+Space`. The leader keys remain available when function
-keys are inconvenient.
+Default leader: `Ctrl+Space`, with `Alt+Space` accepted by default for macOS
+Terminal.app and other environments that reserve `Ctrl+Space`. The leader keys
+remain available when function keys are inconvenient.
 
 | Key | Action |
 | --- | --- |
@@ -103,8 +107,9 @@ The command palette includes status details for the current system, selected git
 repo, and configured health probes.
 
 Mouse events are forwarded to the focused shell only after the child app enables
-xterm mouse mode. Aetherspace still owns pane chrome and palette mouse events;
-ordinary clicks focus panes.
+xterm mouse mode. Aetherspace still owns pane chrome, palette mouse events,
+tiled split-separator drags, and floating-pane title drags; ordinary clicks focus
+panes.
 
 ## Verification
 

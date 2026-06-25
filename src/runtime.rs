@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{
-    self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{
     Frame,
@@ -208,6 +208,8 @@ struct RuntimeApp {
     /// Nesting depth this process is AT (0 = top-level). Drives the `nested:N`
     /// statusline span; the child env var is already incremented at boot.
     nest_depth: u32,
+    mouse_drag: Option<MouseDrag>,
+    mouse_drag_dirty: bool,
     /// Set by `Action::EditScrollback` once the focused shell's screen has been
     /// written to a temp file. Drained in `run_loop`, which is the only place the
     /// `TerminalGuard` is reachable to restore/spawn-editor/reenter. Never set for
@@ -234,10 +236,11 @@ struct RuntimeAppInit {
     session_persist: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Palette {
     kind: PaletteKind,
     selected: usize,
+    query: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +294,16 @@ enum BannerTone {
     Conflict,
     /// A hard error (e.g. a vanished config file on reload).
     Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MouseDrag {
+    Split(layout::SplitHit),
+    Float {
+        id: PaneId,
+        grab_x: u16,
+        grab_y: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -428,6 +441,8 @@ impl RuntimeApp {
             status_target: init.status_target,
             status_config_handle: init.status_config_handle,
             nest_depth: init.nest_depth,
+            mouse_drag: None,
+            mouse_drag_dirty: false,
             pending_editor: None,
         })
     }
@@ -571,6 +586,7 @@ impl RuntimeApp {
         self.palette = Some(Palette {
             kind: PaletteKind::Commands,
             selected: 0,
+            query: String::new(),
         });
     }
 
@@ -587,6 +603,7 @@ impl RuntimeApp {
                 .selected_project
                 .unwrap_or(0)
                 .min(self.projects.len() - 1),
+            query: String::new(),
         });
     }
 
@@ -595,6 +612,7 @@ impl RuntimeApp {
         self.palette = Some(Palette {
             kind: PaletteKind::StatusDetails,
             selected: 0,
+            query: String::new(),
         });
     }
 
@@ -608,6 +626,7 @@ impl RuntimeApp {
         self.palette = Some(Palette {
             kind: PaletteKind::Layouts,
             selected: 0,
+            query: String::new(),
         });
     }
 
@@ -877,8 +896,18 @@ impl RuntimeApp {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.handle_active_drag(mouse) {
+            return true;
+        }
         if self.palette.is_none() && self.forward_mouse_to_child(mouse) {
             return false;
+        }
+        if self.palette.is_none()
+            && !self.show_help
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.start_chrome_drag(mouse.column, mouse.row)
+        {
+            return true;
         }
         if self.palette.is_none()
             && !self.show_help
@@ -893,6 +922,96 @@ impl RuntimeApp {
         }
         self.last_notice = Some(self.mouse_policy_notice(mouse).to_string());
         true
+    }
+
+    fn handle_active_drag(&mut self, mouse: MouseEvent) -> bool {
+        let Some(drag) = self.mouse_drag.clone() else {
+            return false;
+        };
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => match drag {
+                MouseDrag::Split(hit) => {
+                    if self.session.resize_split_at(&hit, mouse.column, mouse.row) {
+                        self.resize_to_area(self.last_area);
+                        self.mouse_drag_dirty = true;
+                    }
+                    self.last_notice = Some("split resized".to_string());
+                    true
+                }
+                MouseDrag::Float { id, grab_x, grab_y } => {
+                    let workspace =
+                        workspace_rect(self.last_area, self.banner_rows(), self.compact_chrome);
+                    let x = mouse.column.saturating_sub(grab_x);
+                    let y = mouse.row.saturating_sub(grab_y);
+                    if self.session.move_floating_to(id, x, y, workspace) {
+                        self.resize_to_area(self.last_area);
+                        self.mouse_drag_dirty = true;
+                    }
+                    self.last_notice = Some("floating pane moved".to_string());
+                    true
+                }
+            },
+            MouseEventKind::Up(_) => {
+                self.mouse_drag = None;
+                if self.mouse_drag_dirty {
+                    self.session_dirty = true;
+                    self.mouse_drag_dirty = false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn start_chrome_drag(&mut self, column: u16, row: u16) -> bool {
+        let workspace = workspace_rect(self.last_area, self.banner_rows(), self.compact_chrome);
+        if let Some((id, grab_x, grab_y)) = self.floating_title_at(workspace, column, row) {
+            self.session.focus_pane(id);
+            self.mouse_drag = Some(MouseDrag::Float { id, grab_x, grab_y });
+            self.mouse_drag_dirty = false;
+            self.last_notice = Some("drag to move floating pane".to_string());
+            return true;
+        }
+        if self.floating_at(workspace, column, row).is_some() {
+            return false;
+        }
+        if let Some(hit) = self.session.split_hit_at(workspace, column, row) {
+            self.mouse_drag = Some(MouseDrag::Split(hit));
+            self.mouse_drag_dirty = false;
+            self.last_notice = Some("drag to resize split".to_string());
+            return true;
+        }
+        false
+    }
+
+    fn floating_title_at(
+        &self,
+        workspace: Rect,
+        column: u16,
+        row: u16,
+    ) -> Option<(PaneId, u16, u16)> {
+        if self.compact_chrome || self.session.zoomed().is_some() {
+            return None;
+        }
+        self.session.floating().iter().rev().find_map(|(id, geom)| {
+            let rect = layout::resolve_float(*geom, workspace);
+            let title = label_rect(rect);
+            rect_contains(title, column, row).then_some((
+                *id,
+                column.saturating_sub(rect.x),
+                row.saturating_sub(rect.y),
+            ))
+        })
+    }
+
+    fn floating_at(&self, workspace: Rect, column: u16, row: u16) -> Option<PaneId> {
+        if self.session.zoomed().is_some() {
+            return None;
+        }
+        self.session.floating().iter().rev().find_map(|(id, geom)| {
+            let rect = layout::resolve_float(*geom, workspace);
+            rect_contains(rect, column, row).then_some(*id)
+        })
     }
 
     fn forward_mouse_to_child(&mut self, mouse: MouseEvent) -> bool {
@@ -1020,17 +1139,30 @@ impl RuntimeApp {
         if key.kind == KeyEventKind::Release {
             return Some(false);
         }
-        self.palette?;
+        let palette = self.palette.as_ref()?;
         match key.code {
             KeyCode::Esc => {
                 self.palette = None;
                 Some(true)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Char(c)
+                if palette_supports_filter(palette.kind)
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.push_palette_query(c);
+                Some(true)
+            }
+            KeyCode::Backspace if palette_supports_filter(palette.kind) => {
+                self.pop_palette_query();
+                Some(true)
+            }
+            KeyCode::Up => {
                 self.move_palette(-1);
                 Some(true)
             }
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Tab => {
                 self.move_palette(1);
                 Some(true)
             }
@@ -1044,19 +1176,37 @@ impl RuntimeApp {
     }
 
     fn move_palette(&mut self, delta: isize) {
-        let Some(palette) = self.palette else {
+        let Some(mut palette) = self.palette.take() else {
             return;
         };
-        let len = self.palette_len(palette.kind);
+        let len = self.filtered_palette_len(&palette);
         if len == 0 {
+            palette.selected = 0;
+            self.palette = Some(palette);
             return;
         }
         let current = palette.selected.min(len - 1);
         let next = (current as isize + delta).rem_euclid(len as isize) as usize;
-        self.palette = Some(Palette {
-            selected: next,
-            ..palette
-        });
+        palette.selected = next;
+        self.palette = Some(palette);
+    }
+
+    fn push_palette_query(&mut self, c: char) {
+        let Some(mut palette) = self.palette.take() else {
+            return;
+        };
+        palette.query.push(c);
+        palette.selected = 0;
+        self.palette = Some(palette);
+    }
+
+    fn pop_palette_query(&mut self) {
+        let Some(mut palette) = self.palette.take() else {
+            return;
+        };
+        palette.query.pop();
+        palette.selected = 0;
+        self.palette = Some(palette);
     }
 
     fn palette_len(&self, kind: PaletteKind) -> usize {
@@ -1068,26 +1218,76 @@ impl RuntimeApp {
         }
     }
 
+    fn filtered_palette_len(&self, palette: &Palette) -> usize {
+        self.filtered_palette_indices(palette).len()
+    }
+
+    fn filtered_palette_indices(&self, palette: &Palette) -> Vec<usize> {
+        let query = palette.query.trim().to_ascii_lowercase();
+        match palette.kind {
+            PaletteKind::Commands => COMMAND_ITEMS
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    (query.is_empty()
+                        || contains_ci(item.label, &query)
+                        || contains_ci(item.detail, &query))
+                    .then_some(idx)
+                })
+                .collect(),
+            PaletteKind::Projects => self
+                .projects
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, project)| {
+                    let path = project.path.display().to_string();
+                    (query.is_empty()
+                        || contains_ci(project.name.as_str(), &query)
+                        || contains_ci(path.as_str(), &query))
+                    .then_some(idx)
+                })
+                .collect(),
+            PaletteKind::Layouts => self
+                .layouts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, layout)| {
+                    (query.is_empty() || contains_ci(layout.name.as_str(), &query)).then_some(idx)
+                })
+                .collect(),
+            PaletteKind::StatusDetails => {
+                (0..self.palette_len(PaletteKind::StatusDetails)).collect()
+            }
+        }
+    }
+
     fn accept_palette(&mut self) -> bool {
         let Some(palette) = self.palette.take() else {
             return false;
         };
+        let indices = self.filtered_palette_indices(&palette);
+        let Some(index) = indices
+            .get(palette.selected.min(indices.len().saturating_sub(1)))
+            .copied()
+        else {
+            return true;
+        };
         match palette.kind {
             PaletteKind::Commands => {
-                let Some(item) = COMMAND_ITEMS.get(palette.selected) else {
+                let Some(item) = COMMAND_ITEMS.get(index) else {
                     return true;
                 };
                 self.run_palette_command(item.command)
             }
             PaletteKind::Projects => {
-                if let Err(e) = self.open_project(palette.selected) {
+                if let Err(e) = self.open_project(index) {
                     self.last_error = Some(format!("project open failed: {e}"));
                 }
                 true
             }
             PaletteKind::StatusDetails => true,
             PaletteKind::Layouts => {
-                self.apply_layout(palette.selected);
+                self.apply_layout(index);
                 true
             }
         }
@@ -1668,7 +1868,7 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
         draw_palette(frame, app, workspace);
     }
     if app.show_help {
-        draw_help(frame, &app.keymap, workspace);
+        draw_help(frame, app, workspace);
     }
 
     if !app.compact_chrome {
@@ -1761,17 +1961,15 @@ fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floati
 }
 
 fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
-    let Some(palette) = app.palette else {
+    let Some(palette) = app.palette.as_ref() else {
         return;
     };
-    let len = app.palette_len(palette.kind);
+    let len = app.filtered_palette_len(palette);
     let desired_height = match palette.kind {
-        PaletteKind::Commands => (COMMAND_ITEMS.len() + 2) as u16,
-        PaletteKind::Projects => (app.projects.len().min(12) + 2) as u16,
-        PaletteKind::StatusDetails => {
-            (app.palette_len(PaletteKind::StatusDetails).min(14) + 2) as u16
-        }
-        PaletteKind::Layouts => (app.layouts.len().min(12) + 2) as u16,
+        PaletteKind::Commands => (len.min(COMMAND_ITEMS.len()) + 3) as u16,
+        PaletteKind::Projects => (len.min(12) + 3) as u16,
+        PaletteKind::StatusDetails => (len.min(14) + 3) as u16,
+        PaletteKind::Layouts => (len.min(12) + 3) as u16,
     };
     let rect = overlay_rect(workspace, 78, desired_height.max(5));
     if rect.width < 8 || rect.height < 3 {
@@ -1793,17 +1991,17 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
     frame.render_widget(block, rect);
 
     let lines = if len == 0 {
-        vec![Line::from(Span::styled(
-            " no entries",
-            Style::default().fg(Theme::DIM),
-        ))]
+        vec![
+            palette_header_line(palette),
+            Line::from(Span::styled(" no matches", Style::default().fg(Theme::DIM))),
+        ]
     } else {
         palette_lines(app, palette, inner.height, inner.width)
     };
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn draw_help(frame: &mut Frame, keymap: &Keymap, workspace: Rect) {
+fn draw_help(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
     let rect = overlay_rect(workspace, 86, 17);
     if rect.width < 20 || rect.height < 8 {
         return;
@@ -1822,7 +2020,7 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap, workspace: Rect) {
     // claims a Ctrl chord works on terminals that cannot send it.
     let lines = vec![
         help_line(
-            advertised_chord_label(keymap, BindAction::CommandPalette, false),
+            advertised_chord_label(&app.keymap, BindAction::CommandPalette, false),
             "commands",
             "open command palette",
         ),
@@ -1832,13 +2030,13 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap, workspace: Rect) {
             "fallback if Ctrl+Enter is not sent",
         ),
         help_line(
-            advertised_chord_label(keymap, BindAction::Help, false),
+            advertised_chord_label(&app.keymap, BindAction::Help, false),
             "help",
             "open this guide",
         ),
         help_line("click".to_string(), "focus", "select a pane"),
         help_line(
-            advertised_chord_label(keymap, BindAction::FocusNext, false),
+            advertised_chord_label(&app.keymap, BindAction::FocusNext, false),
             "focus",
             "next pane if your terminal sends it",
         ),
@@ -1857,8 +2055,16 @@ fn draw_help(frame: &mut Frame, keymap: &Keymap, workspace: Rect) {
             "reset",
             "collapse clutter to one project shell",
         ),
-        help_line(f_key_summary(keymap), "fallback", "function-key shortcuts"),
-        help_line("^Space".to_string(), "leader", "legacy command prefix"),
+        help_line(
+            f_key_summary(&app.keymap),
+            "fallback",
+            "function-key shortcuts",
+        ),
+        help_line(
+            app.input.leader_label(),
+            "leader",
+            "command prefix without function keys",
+        ),
         help_line("Esc/Enter".to_string(), "close", "close this help panel"),
     ];
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1920,43 +2126,50 @@ fn help_line(key: String, label: &'static str, detail: &'static str) -> Line<'st
 
 fn palette_lines(
     app: &RuntimeApp,
-    palette: Palette,
+    palette: &Palette,
     height: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
+    let mut lines = vec![palette_header_line(palette)];
+    let item_height = height.saturating_sub(1);
+    if item_height == 0 {
+        return lines;
+    }
+
+    let indices = app.filtered_palette_indices(palette);
     if palette.kind == PaletteKind::StatusDetails {
         let rows = status::status_detail_rows(&app.status);
-        let len = rows.len();
-        let view_rows = height.max(1) as usize;
+        let len = indices.len();
+        let view_rows = item_height.max(1) as usize;
         let selected = palette.selected.min(len.saturating_sub(1));
         let start = selected.saturating_sub(view_rows.saturating_sub(1));
         let end = len.min(start + view_rows);
-        return (start..end)
-            .map(|idx| {
-                let row = &rows[idx];
-                palette_line(
-                    idx == selected,
-                    row.label.as_str(),
-                    row.detail.as_str(),
-                    width,
-                )
-            })
-            .collect();
+        lines.extend((start..end).map(|idx| {
+            let row = &rows[indices[idx]];
+            palette_line(
+                idx == selected,
+                row.label.as_str(),
+                row.detail.as_str(),
+                width,
+            )
+        }));
+        return lines;
     }
 
-    let len = app.palette_len(palette.kind);
-    let rows = height.max(1) as usize;
+    let len = indices.len();
+    let rows = item_height.max(1) as usize;
     let selected = palette.selected.min(len.saturating_sub(1));
     let start = selected.saturating_sub(rows.saturating_sub(1));
     let end = len.min(start + rows);
-    (start..end)
-        .map(|idx| match palette.kind {
+    lines.extend((start..end).map(|idx| {
+        let source = indices[idx];
+        match palette.kind {
             PaletteKind::Commands => {
-                let item = COMMAND_ITEMS[idx];
+                let item = COMMAND_ITEMS[source];
                 palette_line(idx == selected, item.label, item.detail, width)
             }
             PaletteKind::Projects => {
-                let project = &app.projects[idx];
+                let project = &app.projects[source];
                 palette_line(
                     idx == selected,
                     project.name.as_str(),
@@ -1965,14 +2178,36 @@ fn palette_lines(
                 )
             }
             PaletteKind::Layouts => {
-                let layout = &app.layouts[idx];
+                let layout = &app.layouts[source];
                 let steps = layout.steps.len();
                 let detail = format!("{steps} step{}", if steps == 1 { "" } else { "s" });
                 palette_line(idx == selected, layout.name.as_str(), &detail, width)
             }
             PaletteKind::StatusDetails => unreachable!("status palette handled above"),
-        })
-        .collect()
+        }
+    }));
+    lines
+}
+
+fn palette_supports_filter(kind: PaletteKind) -> bool {
+    !matches!(kind, PaletteKind::StatusDetails)
+}
+
+fn palette_header_line(palette: &Palette) -> Line<'static> {
+    let text = if palette_supports_filter(palette.kind) {
+        if palette.query.is_empty() {
+            " type to filter | arrows/tab select | enter run | esc close".to_string()
+        } else {
+            format!(" filter: {} | backspace edit | enter run", palette.query)
+        }
+    } else {
+        " up/down inspect | enter/esc close".to_string()
+    };
+    Line::from(Span::styled(text, Style::default().fg(Theme::DIM)))
+}
+
+fn contains_ci(haystack: &str, lowercase_query: &str) -> bool {
+    haystack.to_ascii_lowercase().contains(lowercase_query)
 }
 
 fn palette_line(selected: bool, label: &str, detail: &str, width: u16) -> Line<'static> {
@@ -2130,7 +2365,7 @@ fn status_message(app: &RuntimeApp) -> (String, StatusTone) {
         )
     } else if app.palette.is_some() {
         (
-            "enter run  up/down select  esc close".to_string(),
+            "type filter  up/down select  enter run  esc close".to_string(),
             StatusTone::Normal,
         )
     } else if app.input.in_viewer_find() {
@@ -2156,7 +2391,7 @@ fn status_message(app: &RuntimeApp) -> (String, StatusTone) {
         )
     } else {
         (
-            format!("click focus  {hint}  ^Space leader"),
+            format!("click focus  {hint}  {} leader", app.input.leader_label()),
             StatusTone::Normal,
         )
     }
@@ -2593,6 +2828,171 @@ mod tests {
         assert_eq!(nest_segment(3).as_deref(), Some("nested:3 "));
     }
 
+    fn palette_test_app() -> RuntimeApp {
+        let (tx, _rx) = mpsc::channel();
+        let config = Config::default();
+        RuntimeApp {
+            running: true,
+            session: Session::single_shell(PathBuf::from("/work/alpha")),
+            panes: BTreeMap::new(),
+            input: InputRouter::new(InputConfig::default()),
+            keymap: Arc::new(Keymap::default()),
+            projects: vec![
+                Project {
+                    name: "alpha".into(),
+                    path: PathBuf::from("/work/alpha"),
+                    viewer: None,
+                },
+                Project {
+                    name: "beta-shell".into(),
+                    path: PathBuf::from("/work/beta-shell"),
+                    viewer: None,
+                },
+            ],
+            selected_project: Some(0),
+            default_viewer: PathBuf::from("README.md"),
+            layouts: vec![
+                NamedLayout {
+                    name: "dev stack".into(),
+                    steps: vec![LayoutStep::Split {
+                        dir: SplitDir::Horizontal,
+                        ratio: None,
+                    }],
+                },
+                NamedLayout {
+                    name: "review".into(),
+                    steps: Vec::new(),
+                },
+            ],
+            palette: None,
+            show_help: false,
+            compact_chrome: false,
+            last_area: Rect::new(0, 0, 80, 24),
+            scrollback: 1000,
+            notify: tx,
+            last_error: None,
+            last_notice: None,
+            config_warning: None,
+            banner: None,
+            session_dirty: false,
+            session_persist: true,
+            status: StatusSnapshot::default(),
+            status_target: StatusTarget::new(None),
+            status_config_handle: StatusConfigHandle::new(status::StatusConfig::from_config(
+                &config,
+            )),
+            nest_depth: 0,
+            mouse_drag: None,
+            mouse_drag_dirty: false,
+            pending_editor: None,
+        }
+    }
+
+    #[test]
+    fn command_palette_filters_by_label_and_detail() {
+        let app = palette_test_app();
+        let label_query = Palette {
+            kind: PaletteKind::Commands,
+            selected: 0,
+            query: "comp".to_string(),
+        };
+        let labels: Vec<&str> = app
+            .filtered_palette_indices(&label_query)
+            .into_iter()
+            .map(|idx| COMMAND_ITEMS[idx].label)
+            .collect();
+        assert_eq!(labels, vec!["compact ui"]);
+
+        let detail_query = Palette {
+            query: "hide pane".to_string(),
+            ..label_query
+        };
+        let labels: Vec<&str> = app
+            .filtered_palette_indices(&detail_query)
+            .into_iter()
+            .map(|idx| COMMAND_ITEMS[idx].label)
+            .collect();
+        assert_eq!(labels, vec!["compact ui"]);
+    }
+
+    #[test]
+    fn palette_filter_is_case_insensitive() {
+        let app = palette_test_app();
+        let palette = Palette {
+            kind: PaletteKind::Projects,
+            selected: 0,
+            query: "BETA".to_string(),
+        };
+        let indices = app.filtered_palette_indices(&palette);
+        assert_eq!(indices, vec![1]);
+
+        let palette = Palette {
+            kind: PaletteKind::Layouts,
+            selected: 0,
+            query: "REVIEW".to_string(),
+        };
+        let indices = app.filtered_palette_indices(&palette);
+        assert_eq!(indices, vec![1]);
+    }
+
+    #[test]
+    fn palette_selection_resets_after_filter_change() {
+        let mut app = palette_test_app();
+        app.palette = Some(Palette {
+            kind: PaletteKind::Commands,
+            selected: 8,
+            query: String::new(),
+        });
+        app.push_palette_query('q');
+        let palette = app.palette.as_ref().expect("palette remains open").clone();
+        assert_eq!(palette.query, "q");
+        assert_eq!(palette.selected, 0);
+        assert_eq!(app.filtered_palette_len(&palette), 1);
+    }
+
+    #[test]
+    fn palette_enter_uses_filtered_original_index() {
+        let mut app = palette_test_app();
+        app.palette = Some(Palette {
+            kind: PaletteKind::Commands,
+            selected: 0,
+            query: "quit".to_string(),
+        });
+        assert!(app.accept_palette());
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn floating_pane_mouse_hits_win_over_underlying_split_separator() {
+        let mut app = palette_test_app();
+        app.last_area = Rect::new(0, 0, 100, 30);
+        app.session
+            .split_focused_shell(PathBuf::from("/work/beta"), SplitDir::Horizontal)
+            .expect("split");
+        let floated = app
+            .session
+            .open_shell(PathBuf::from("/work/float"), "FLOAT".to_string())
+            .id;
+        assert_eq!(app.session.focused(), Some(floated));
+        assert!(app.session.toggle_float_focused(FloatGeom {
+            x: 48,
+            y: 0,
+            width: 20,
+            height: 8,
+        }));
+
+        let separator_column_under_float = 50;
+        assert!(app.start_chrome_drag(separator_column_under_float, 0));
+        assert!(matches!(
+            app.mouse_drag,
+            Some(MouseDrag::Float { id, .. }) if id == floated
+        ));
+
+        app.mouse_drag = None;
+        assert!(!app.start_chrome_drag(separator_column_under_float, 2));
+        assert_eq!(app.mouse_drag, None);
+    }
+
     #[test]
     fn workspace_excludes_statusline() {
         let area = Rect::new(0, 0, 80, 24);
@@ -2798,9 +3198,25 @@ mod tests {
             global_shortcut(
                 &map,
                 false,
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT)
+            ),
+            Some(Action::OpenHelp)
+        );
+        assert_eq!(
+            global_shortcut(
+                &map,
+                false,
                 KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)
             ),
             Some(Action::FocusNext)
+        );
+        assert_eq!(
+            global_shortcut(
+                &map,
+                false,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::ALT)
+            ),
+            Some(Action::FocusPrev)
         );
         // Shell-safety cases: plain '?', plain Tab, Shift+F2 fall through to typing.
         assert_eq!(global_shortcut(&map, false, key(KeyCode::Char('?'))), None);

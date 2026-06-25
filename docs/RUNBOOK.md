@@ -30,7 +30,8 @@ Expected path:
    status; configured probes appear as `health:ok/total`.
 4. `Ctrl+/` or `Alt+/` opens help again.
 5. `Ctrl+Enter` or `Alt+Enter` opens the command palette.
-6. The `status details` command opens current system, git, and probe rows.
+6. Type `status`, then `Enter`; the filtered `status details` command opens
+   current system, git, and probe rows.
 7. `Enter` or `Esc` closes the status details palette.
 8. The command palette can open a viewer pane for the selected project.
 9. `j` scrolls the focused viewer.
@@ -38,19 +39,21 @@ Expected path:
    focuses it when child mouse capture is inactive.
 11. The command palette can open the project picker.
 12. `Enter` selects a project and opens a project shell.
-13. `reset workspace` collapses a cluttered session to one shell.
+13. Type `reset`, then `Enter`; the filtered `reset workspace` command
+    collapses a cluttered session to one shell.
 14. The command palette can quit; `F10` remains a fallback quit key.
 
-Legacy leader path:
+Leader path:
 
-1. `Ctrl+Space c` opens the command palette.
+1. `Ctrl+Space c` opens the command palette. On macOS Terminal.app, use
+   `Alt+Space c` if `Ctrl+Space` is reserved by the OS.
 2. The `status details` command opens current system, git, and probe rows.
 3. `Enter` or `Esc` closes the status details palette.
-4. `Ctrl+Space v` opens a viewer pane for the selected project.
+4. `Alt+Space v` opens a viewer pane for the selected project.
 5. `j` scrolls the focused viewer.
-6. `Ctrl+Space p` opens the project picker.
+6. `Alt+Space p` opens the project picker.
 7. `Enter` selects a project and opens a project shell.
-8. `Ctrl+Space q` exits with status 0 and restores the terminal.
+8. `Alt+Space q` exits with status 0 and restores the terminal.
 
 Optional mouse smoke:
 
@@ -59,6 +62,9 @@ Optional mouse smoke:
 3. The child receives coordinates relative to its pane while capture is active.
 4. Click a non-capturing pane to focus it; palette and pane chrome clicks remain
    owned by Aetherspace.
+5. Split the workspace, then drag the separator between tiled panes to resize it.
+6. Float a pane, then drag its title row to move it. Compact mode intentionally
+   disables floating-title drags because the title row is hidden.
 
 Terminal recovery if a development build dies mid-frame:
 
@@ -86,7 +92,8 @@ Useful defaults:
 - `[[probes]]`: health URLs shown as `health:ok/total` in the statusline.
   Probe names and current states are visible from command palette status details.
 - `[poll]`: system, git, and health polling cadences in seconds.
-- `[input].leader`: accepts `ctrl-space`, `ctrl-@`, `ctrl-g`, `alt-g`, and `esc`.
+- `[input].leader`: accepts `ctrl-space`, `ctrl-@`, `alt-space`, `ctrl-g`,
+  `alt-g`, and `esc`.
 - `[workflow].startup_project`: exact project name to select first.
 - `[workflow].default_viewer`: project-relative viewer document.
 
@@ -110,8 +117,10 @@ Current deliberate non-goals:
 - No native renderer as the default runtime.
 - No broad session persistence or storage layer.
 - No file-browser/editor expansion.
-- No mouse-driven Aetherspace chrome manipulation yet. Child mouse forwarding is
-  limited to focused shell panes after the child enables an xterm mouse mode.
+- No arbitrary drag-to-rearrange layout editor yet. Mouse chrome manipulation is
+  limited to tiled split resize and floating-pane title movement; child mouse
+  forwarding is limited to focused shell panes after the child enables xterm
+  mouse mode.
 - Status polling is runtime-only; it does not add historical metrics storage or
   persist probe results.
 

@@ -47,6 +47,10 @@ impl Leader {
                 Some(Self::CtrlSpace)
             }
             "esc" | "escape" => Some(Self::Key(KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE))),
+            "alt-space" | "option-space" => Some(Self::Key(KeyBinding::new(
+                KeyCode::Char(' '),
+                KeyModifiers::ALT,
+            ))),
             _ => parse_modified_char(&normalized),
         }
     }
@@ -55,6 +59,7 @@ impl Leader {
         match self {
             Self::CtrlSpace => {
                 (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::ALT))
                     || key.code == KeyCode::Null
             }
             Self::Key(binding) => binding.matches(key),
@@ -70,7 +75,13 @@ impl Leader {
 
     fn label(self) -> String {
         match self {
-            Self::CtrlSpace => "^Space".to_string(),
+            Self::CtrlSpace => {
+                if cfg!(target_os = "macos") {
+                    "Alt-Space".to_string()
+                } else {
+                    "^Space".to_string()
+                }
+            }
             Self::Key(binding) => binding.label(),
         }
     }
@@ -735,6 +746,27 @@ mod tests {
         let mut router = InputRouter::new(InputConfig::default());
         assert_eq!(router.route_key(ctrl(KeyCode::Char(' '))), Action::Render);
         assert_eq!(router.route_key(key(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    #[test]
+    fn default_leader_accepts_alt_space_fallback() {
+        let mut router = InputRouter::new(InputConfig::default());
+        assert_eq!(router.route_key(alt(KeyCode::Char(' '))), Action::Render);
+        assert_eq!(router.mode_label(), "leader");
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('c'))),
+            Action::OpenCommandPalette
+        );
+    }
+
+    #[test]
+    fn configured_leader_does_not_consume_alt_space() {
+        let mut router = InputRouter::new(InputConfig::from_leader_name("ctrl-g"));
+        assert_eq!(
+            router.route_key(alt(KeyCode::Char(' '))),
+            Action::SendBytes(b"\x1b ".to_vec())
+        );
+        assert_eq!(router.mode_label(), "shell capture");
     }
 
     #[test]

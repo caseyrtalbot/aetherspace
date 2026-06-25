@@ -461,6 +461,11 @@ impl RuntimeApp {
         self.panes.get_mut(&id)
     }
 
+    fn focused_pane(&self) -> Option<&PaneRuntime> {
+        let id = self.session.focused()?;
+        self.panes.get(&id)
+    }
+
     fn selected_project(&self) -> Option<&Project> {
         self.selected_project.and_then(|idx| self.projects.get(idx))
     }
@@ -946,13 +951,27 @@ impl RuntimeApp {
     }
 
     fn focus_pane_at(&mut self, column: u16, row: u16) -> bool {
-        if let Some(id) = self.pane_at(column, row)
-            && self.session.focus_pane(id)
-        {
-            self.resize_to_area(self.last_area);
-            return true;
+        let Some(id) = self.pane_at(column, row) else {
+            return false;
+        };
+        let prev = self.session.focused();
+        if !self.session.focus_pane(id) {
+            return false;
         }
-        false
+        // A mouse focus change to a DIFFERENT pane mid-find tears find down: the
+        // keyboard force-exit in dispatch_key cannot fire for a mouse event, so clear
+        // the router mode and the old viewer's highlights here (keyboard focus-switch
+        // keys are inert during find, so the mouse is the only path that reaches this).
+        if self.input.in_viewer_find() && prev != Some(id) {
+            self.input.exit_viewer_find();
+            if let Some(prev_id) = prev
+                && let Some(pane) = self.panes.get_mut(&prev_id)
+            {
+                pane.clear_viewer_find();
+            }
+        }
+        self.resize_to_area(self.last_area);
+        true
     }
 
     fn pane_at(&self, column: u16, row: u16) -> Option<PaneId> {
@@ -1138,6 +1157,19 @@ impl RuntimeApp {
             return false;
         }
         let rows = self.focused_content_height();
+        // `/` enters incremental find. Flip the router into find mode ONLY if a viewer
+        // accepted `begin_viewer_find` (atomic entry), so the mode and the viewer's
+        // find state can never desync.
+        if key.code == KeyCode::Char('/') {
+            if self
+                .focused_pane_mut()
+                .is_some_and(PaneRuntime::begin_viewer_find)
+            {
+                self.input.enter_viewer_find();
+                return true;
+            }
+            return false;
+        }
         let Some(pane) = self.focused_pane_mut() else {
             return false;
         };
@@ -1152,6 +1184,11 @@ impl RuntimeApp {
             }
             KeyCode::Home => pane.scroll_viewer_home(),
             KeyCode::End => pane.scroll_viewer_end(rows),
+            // Committed find navigation (n/N) and clear (Esc) — direct pane calls,
+            // matching the scroll arms; no Action round-trip.
+            KeyCode::Char('n') => pane.viewer_find_next(rows),
+            KeyCode::Char('N') => pane.viewer_find_prev(rows),
+            KeyCode::Esc => pane.clear_viewer_find(),
             _ => false,
         }
     }
@@ -1355,9 +1392,27 @@ fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     dispatch_key(app, key) || cleared_warning || cleared_banner
 }
 
+/// The modal viewer-find predicate: keystrokes route to the find buffer ONLY while a
+/// viewer is focused. If focus leaves the viewer while find is active, the caller
+/// force-exits find instead. Pulled out as a free fn so the rule is unit-testable
+/// without constructing a `RuntimeApp` (which would spawn PTYs).
+fn should_route_to_find(in_viewer_find: bool, focused_is_viewer: bool) -> bool {
+    in_viewer_find && focused_is_viewer
+}
+
 fn dispatch_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     if app.show_help {
         return handle_help_key(app, key);
+    }
+    // Viewer find is modal: while active and the viewer is still focused, EVERY key
+    // edits the query (so F-keys/scroll/leader cannot steal keystrokes). If focus
+    // left the viewer (e.g. an async layout change), tear find down and fall through.
+    if app.input.in_viewer_find() {
+        if should_route_to_find(true, app.focused_is_viewer()) {
+            let action = app.input.route_key(key);
+            return apply_action(app, action);
+        }
+        app.input.exit_viewer_find();
     }
     if let Some(action) = global_shortcut(&app.keymap, app.focused_is_viewer(), key) {
         // Help collapses into Action::OpenHelp; apply_action opens the overlay.
@@ -1510,6 +1565,25 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             true
         }
         Action::ReloadConfig => app.reload_config(),
+        Action::ViewerFind(query) => {
+            let rows = app.focused_content_height();
+            if let Some(pane) = app.focused_pane_mut() {
+                pane.set_viewer_query(&query, rows);
+            }
+            true
+        }
+        Action::ViewerFindCommit => {
+            app.last_notice = app
+                .focused_pane_mut()
+                .and_then(|pane| pane.viewer_find_status());
+            true
+        }
+        Action::ViewerFindCancel => {
+            if let Some(pane) = app.focused_pane_mut() {
+                pane.cancel_viewer_find();
+            }
+            true
+        }
         Action::Noop => dirty,
     }
 }
@@ -1654,6 +1728,16 @@ fn draw_pane(frame: &mut Frame, app: &RuntimeApp, id: PaneId, area: Rect, floati
         let mut title = pane.title(spec);
         if let Some(status) = pane.viewer_status() {
             title = format!("{title}  {status}");
+        }
+        // Surface incremental find on the focused viewer's label row: the live
+        // `/query` while typing, plus the match count (i/n or "no matches").
+        if focused {
+            if app.input.in_viewer_find() {
+                title = format!("{title}  /{}", pane.viewer_find_query().unwrap_or_default());
+            }
+            if let Some(find_status) = pane.viewer_find_status() {
+                title = format!("{title}  {find_status}");
+            }
         }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -2049,9 +2133,18 @@ fn status_message(app: &RuntimeApp) -> (String, StatusTone) {
             "enter run  up/down select  esc close".to_string(),
             StatusTone::Normal,
         )
+    } else if app.input.in_viewer_find() {
+        let query = app
+            .focused_pane()
+            .and_then(PaneRuntime::viewer_find_query)
+            .unwrap_or_default();
+        (
+            format!("find  /{query}  enter accept  esc cancel"),
+            StatusTone::Notice,
+        )
     } else if app.focused_is_viewer() {
         (
-            format!("viewer  j/k scroll  Tab focus  {hint}"),
+            format!("viewer  j/k scroll  / find  n/N next  Tab focus  {hint}"),
             StatusTone::Normal,
         )
     } else if app.input.mode_label() == "leader" {
@@ -2535,6 +2628,16 @@ mod tests {
         assert_eq!(banner_rect(area, 1, true), Rect::new(0, 0, 80, 1));
         assert_eq!(workspace_rect(area, 1, true), Rect::new(0, 1, 80, 23));
         assert_eq!(status_rect(area, 1, true).height, 0);
+    }
+
+    #[test]
+    fn should_route_to_find_only_when_viewer_focused() {
+        // Keystrokes go to the find buffer ONLY while find is active AND a viewer is
+        // focused. If focus left the viewer, the dispatch force-exits find instead.
+        assert!(should_route_to_find(true, true));
+        assert!(!should_route_to_find(true, false));
+        assert!(!should_route_to_find(false, true));
+        assert!(!should_route_to_find(false, false));
     }
 
     #[test]

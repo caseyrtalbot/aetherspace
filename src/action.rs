@@ -6,14 +6,21 @@ use crate::layout::SplitDir;
 pub(crate) enum Action {
     Quit,
     Render,
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     SendBytes(Vec<u8>),
-    SplitFocusedPane { dir: SplitDir },
+    SplitFocusedPane {
+        dir: SplitDir,
+    },
     RestartFocusedPane,
     CloseFocusedPane,
     FocusNext,
     FocusPrev,
-    ResizeFocusedPane { delta: i16 },
+    ResizeFocusedPane {
+        delta: i16,
+    },
     ToggleZoomFocusedPane,
     ToggleFloatFocusedPane,
     ToggleStack,
@@ -25,6 +32,12 @@ pub(crate) enum Action {
     OpenProjectShell,
     EditScrollback,
     ReloadConfig,
+    /// Viewer incremental find: the live query as it is typed (re-search each edit).
+    ViewerFind(String),
+    /// Lock in the current find (exit the input loop; matches persist for n/N).
+    ViewerFindCommit,
+    /// Abandon the find and restore the pre-find scroll position.
+    ViewerFindCancel,
     Noop,
 }
 

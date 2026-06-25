@@ -181,6 +181,80 @@ impl PaneRuntime {
             Self::Viewer(viewer) => Some(viewer.status()),
         }
     }
+
+    pub(crate) fn begin_viewer_find(&mut self) -> bool {
+        match self {
+            Self::Shell(_) => false,
+            Self::Viewer(viewer) => {
+                viewer.begin_find();
+                true
+            }
+        }
+    }
+
+    pub(crate) fn set_viewer_query(&mut self, query: &str, viewport_rows: u16) -> bool {
+        match self {
+            Self::Shell(_) => false,
+            Self::Viewer(viewer) => {
+                viewer.set_query(query, viewport_rows);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn viewer_find_next(&mut self, viewport_rows: u16) -> bool {
+        match self {
+            Self::Shell(_) => false,
+            Self::Viewer(viewer) => {
+                viewer.next_match(viewport_rows);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn viewer_find_prev(&mut self, viewport_rows: u16) -> bool {
+        match self {
+            Self::Shell(_) => false,
+            Self::Viewer(viewer) => {
+                viewer.prev_match(viewport_rows);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn cancel_viewer_find(&mut self) -> bool {
+        match self {
+            Self::Shell(_) => false,
+            Self::Viewer(viewer) => {
+                viewer.cancel_find();
+                true
+            }
+        }
+    }
+
+    pub(crate) fn clear_viewer_find(&mut self) -> bool {
+        match self {
+            Self::Shell(_) => false,
+            Self::Viewer(viewer) => {
+                viewer.clear_find();
+                true
+            }
+        }
+    }
+
+    pub(crate) fn viewer_find_status(&self) -> Option<String> {
+        match self {
+            Self::Shell(_) => None,
+            Self::Viewer(viewer) => viewer.find_status(),
+        }
+    }
+
+    pub(crate) fn viewer_find_query(&self) -> Option<String> {
+        match self {
+            Self::Shell(_) => None,
+            Self::Viewer(viewer) => viewer.find_query().map(str::to_string),
+        }
+    }
 }
 
 pub(crate) fn ensure_spec_matches_runtime(

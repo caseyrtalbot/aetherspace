@@ -143,10 +143,15 @@ pub(crate) struct InputRouter {
     keymap: Arc<Keymap>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: the `ViewerFind` variant carries the live query buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InputMode {
     ShellCapture,
     Leader,
+    /// Viewer incremental find: every keystroke edits `query` and re-searches.
+    ViewerFind {
+        query: String,
+    },
 }
 
 impl InputRouter {
@@ -170,6 +175,7 @@ impl InputRouter {
         match self.mode {
             InputMode::ShellCapture => "shell capture",
             InputMode::Leader => "leader",
+            InputMode::ViewerFind { .. } => "find",
         }
     }
 
@@ -181,9 +187,33 @@ impl InputRouter {
         self.config.leader.matches(key)
     }
 
+    /// Enter the viewer find sub-mode with an empty query. The runtime calls this
+    /// only when a viewer is focused and has accepted `begin_viewer_find` (atomic
+    /// entry), so the router mode and the viewer find state flip together.
+    pub(crate) fn enter_viewer_find(&mut self) {
+        self.mode = InputMode::ViewerFind {
+            query: String::new(),
+        };
+    }
+
+    /// Force-leave the viewer find sub-mode (used when focus leaves the viewer).
+    pub(crate) fn exit_viewer_find(&mut self) {
+        if matches!(self.mode, InputMode::ViewerFind { .. }) {
+            self.mode = InputMode::ShellCapture;
+        }
+    }
+
+    pub(crate) fn in_viewer_find(&self) -> bool {
+        matches!(self.mode, InputMode::ViewerFind { .. })
+    }
+
     pub(crate) fn route_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::Noop;
+        }
+
+        if matches!(self.mode, InputMode::ViewerFind { .. }) {
+            return self.route_viewer_find(key);
         }
 
         if self.mode == InputMode::Leader {
@@ -201,6 +231,44 @@ impl InputRouter {
             Action::Noop
         } else {
             Action::SendBytes(bytes)
+        }
+    }
+
+    /// Handle a key while in the viewer find sub-mode. Enter/Esc exit (mutating the
+    /// mode with no outstanding borrow); printable chars and Backspace edit the query
+    /// and emit the live value to re-search. Ctrl/Alt-modified chords are inert so
+    /// they cannot inject control bytes into the query.
+    fn route_viewer_find(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Enter => {
+                self.mode = InputMode::ShellCapture;
+                Action::ViewerFindCommit
+            }
+            KeyCode::Esc => {
+                self.mode = InputMode::ShellCapture;
+                Action::ViewerFindCancel
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let InputMode::ViewerFind { query } = &mut self.mode {
+                    query.push(c);
+                    Action::ViewerFind(query.clone())
+                } else {
+                    Action::Noop
+                }
+            }
+            KeyCode::Backspace => {
+                if let InputMode::ViewerFind { query } = &mut self.mode {
+                    query.pop();
+                    Action::ViewerFind(query.clone())
+                } else {
+                    Action::Noop
+                }
+            }
+            _ => Action::Render,
         }
     }
 
@@ -813,6 +881,59 @@ mod tests {
         // shell-capture (not mid-leader), so a reload triggered right after a leader
         // chord cannot strand the next keypress in leader mode.
         let router = InputRouter::with_keymap(InputConfig::default(), Arc::new(Keymap::default()));
+        assert_eq!(router.mode_label(), "shell capture");
+    }
+
+    #[test]
+    fn viewer_find_builds_query_via_actions() {
+        let mut router = InputRouter::new(InputConfig::default());
+        router.enter_viewer_find();
+        assert!(router.in_viewer_find());
+        assert_eq!(router.mode_label(), "find");
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('b'))),
+            Action::ViewerFind("b".to_string())
+        );
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('e'))),
+            Action::ViewerFind("be".to_string())
+        );
+        assert_eq!(
+            router.route_key(key(KeyCode::Backspace)),
+            Action::ViewerFind("b".to_string())
+        );
+        // A Ctrl-modified chord is inert: it must NOT inject a char into the query.
+        assert_eq!(router.route_key(ctrl(KeyCode::Char('c'))), Action::Render);
+        assert_eq!(
+            router.route_key(key(KeyCode::Char('a'))),
+            Action::ViewerFind("ba".to_string())
+        );
+    }
+
+    #[test]
+    fn viewer_find_enter_commits_and_exits() {
+        let mut router = InputRouter::new(InputConfig::default());
+        router.enter_viewer_find();
+        router.route_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            router.route_key(key(KeyCode::Enter)),
+            Action::ViewerFindCommit
+        );
+        assert!(!router.in_viewer_find());
+        assert_eq!(router.mode_label(), "shell capture");
+    }
+
+    #[test]
+    fn viewer_find_esc_cancels_and_exits() {
+        let mut router = InputRouter::new(InputConfig::default());
+        router.enter_viewer_find();
+        assert_eq!(
+            router.route_key(key(KeyCode::Esc)),
+            Action::ViewerFindCancel
+        );
+        assert!(!router.in_viewer_find());
+        // exit_viewer_find is idempotent / safe when not in find.
+        router.exit_viewer_find();
         assert_eq!(router.mode_label(), "shell capture");
     }
 }

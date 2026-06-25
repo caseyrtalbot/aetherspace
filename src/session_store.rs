@@ -66,7 +66,17 @@ fn save_to_path(session: &Session, path: &Path) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(session).context("serialize session")?;
-    fs::write(path, text).with_context(|| format!("write {}", path.display()))
+    write_atomic(path, text.as_bytes())
+}
+
+/// Write to a sibling temp file then rename over the target. Rename is atomic on
+/// the same filesystem, so a crash mid-write never leaves a half-written
+/// session.toml (autosave fires on every session mutation, raising those odds).
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 
 #[cfg(test)]
@@ -108,6 +118,21 @@ mod tests {
         save_to_path(&session, &path).unwrap();
         let loaded = load_from_path(&path).unwrap().expect("session");
         assert_eq!(loaded, session);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("aetherspace/session.toml");
+        let session = Session::single_shell(PathBuf::from("/work/aetherspace"));
+
+        save_to_path(&session, &path).unwrap();
+
+        assert!(path.exists());
+        assert!(!path.with_extension("toml.tmp").exists());
+        // Overwriting an existing target also succeeds (rename replaces it).
+        save_to_path(&session, &path).unwrap();
+        assert_eq!(load_from_path(&path).unwrap().unwrap(), session);
     }
 
     #[test]

@@ -120,6 +120,11 @@ struct RuntimeApp {
     /// banner until the first keypress dismisses it. No timer exists, so it is
     /// keypress-cleared only (see `handle_key`).
     config_warning: Option<String>,
+    /// Set ONLY by the discrete session-mutating actions (split/close/restart/
+    /// focus/resize/zoom/float, project select, open shell/viewer, reset). Drives
+    /// the reboot-durable autosave in `run_loop`. NEVER set on SendBytes/Pty/
+    /// Render/terminal-driven Resize: typing in a shell must not thrash the disk.
+    session_dirty: bool,
     status: StatusSnapshot,
     status_target: StatusTarget,
     /// Nesting depth this process is AT (0 = top-level). Drives the `nested:N`
@@ -288,6 +293,7 @@ impl RuntimeApp {
             last_error: None,
             last_notice: None,
             config_warning: init.config_warning,
+            session_dirty: false,
             status: StatusSnapshot::default(),
             status_target: init.status_target,
             nest_depth: init.nest_depth,
@@ -325,6 +331,7 @@ impl RuntimeApp {
         };
         self.selected_project = Some(index);
         self.session.select_project(project_selection(&project));
+        self.session_dirty = true;
         self.status_target.set(Some(project.path.clone()));
         self.last_notice = Some(format!("project selected: {}", project.name));
         self.last_error = None;
@@ -383,6 +390,7 @@ impl RuntimeApp {
         let spec = self
             .session
             .open_shell(project.path, format!("SHELL · {}", project.name));
+        self.session_dirty = true;
         self.spawn_runtime_for_spec(spec)
     }
 
@@ -394,6 +402,7 @@ impl RuntimeApp {
         let spec = self
             .session
             .open_viewer(path, format!("VIEWER · {}", project.name));
+        self.session_dirty = true;
         self.spawn_runtime_for_spec(spec)
     }
 
@@ -458,6 +467,7 @@ impl RuntimeApp {
         self.show_help = false;
         self.last_error = None;
         self.last_notice = Some("workspace reset to one project shell".to_string());
+        self.session_dirty = true;
         self.resize_to_area(self.last_area);
         Ok(())
     }
@@ -851,6 +861,14 @@ where
             }
             terminal.draw(|frame| draw(frame, app))?;
             last_draw = Instant::now();
+            // Reboot-durable autosave: persist layout+cwd after a session-mutating
+            // action so a hard kill (kill -9) keeps the same state the clean-exit
+            // save in run() would have written. session_dirty is set only on the
+            // discrete mutations, so shell typing/PTY bytes never reach here.
+            if app.session_dirty {
+                session_store::save(&app.session);
+                app.session_dirty = false;
+            }
         }
     }
     Ok(())
@@ -1012,6 +1030,7 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             } else {
                 app.last_error = None;
             }
+            app.session_dirty = true;
             true
         }
         Action::RestartFocusedPane => {
@@ -1020,30 +1039,37 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             } else {
                 app.last_error = None;
             }
+            app.session_dirty = true;
             true
         }
         Action::CloseFocusedPane => {
             app.close_focused();
+            app.session_dirty = true;
             true
         }
         Action::FocusNext => {
             app.focus_next();
+            app.session_dirty = true;
             true
         }
         Action::FocusPrev => {
             app.focus_prev();
+            app.session_dirty = true;
             true
         }
         Action::ResizeFocusedPane { delta } => {
             app.resize_focused(delta);
+            app.session_dirty = true;
             true
         }
         Action::ToggleZoomFocusedPane => {
             app.toggle_zoom_focused();
+            app.session_dirty = true;
             true
         }
         Action::ToggleFloatFocusedPane => {
             app.toggle_float_focused();
+            app.session_dirty = true;
             true
         }
         Action::ToggleCompactChrome => {

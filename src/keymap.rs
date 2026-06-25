@@ -80,6 +80,7 @@ pub(crate) enum BindAction {
     Viewer,
     Shell,
     EditScrollback,
+    ReloadConfig,
 }
 
 impl BindAction {
@@ -110,6 +111,7 @@ impl BindAction {
             Self::Viewer => Action::OpenProjectViewer,
             Self::Shell => Action::OpenProjectShell,
             Self::EditScrollback => Action::EditScrollback,
+            Self::ReloadConfig => Action::ReloadConfig,
         }
     }
 
@@ -137,6 +139,7 @@ impl BindAction {
             "viewer" => Self::Viewer,
             "shell" => Self::Shell,
             "edit_scrollback" => Self::EditScrollback,
+            "reload" => Self::ReloadConfig,
             _ => return None,
         };
         Some(action)
@@ -371,6 +374,9 @@ fn default_global() -> Vec<(Chord, Binding)> {
         (Chord::Global(F(8), none), Binding::always(Zoom)),
         (Chord::Global(F(9), none), Binding::always(Close)),
         (Chord::Global(F(10), none), Binding::always(Quit)),
+        // F11 reloads config (F1-F10 taken above; r/R are taken in the leader table
+        // by Restart, so reload uses leader g/G + global F11).
+        (Chord::Global(F(11), none), Binding::always(ReloadConfig)),
         (Chord::Global(Tab, none), Binding::viewer_only(FocusNext)),
         (
             Chord::Global(BackTab, none),
@@ -447,6 +453,9 @@ fn default_leader() -> Vec<(Chord, Binding)> {
         (Char('S'), Shell),
         (Char('e'), EditScrollback),
         (Char('E'), EditScrollback),
+        // g/G reload config (r/R are taken by Restart above).
+        (Char('g'), ReloadConfig),
+        (Char('G'), ReloadConfig),
     ];
     entries
         .iter()

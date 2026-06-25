@@ -336,7 +336,7 @@ impl Config {
     /// a typo never wedges startup, returning a banner (including the path) the
     /// runtime surfaces until dismissed.
     pub fn load_with_warning() -> (Self, Option<String>) {
-        let path = xdg::home("XDG_CONFIG_HOME", ".config").join("aetherspace/config.toml");
+        let path = Self::config_path();
         let Ok(text) = fs::read_to_string(&path) else {
             // Missing file is the normal case: defaults, no warning.
             return (Self::default(), None);
@@ -344,6 +344,36 @@ impl Config {
         // File present: a parse failure still falls back to defaults, but here we
         // also surface a one-line banner that names the path the user must fix.
         Self::from_toml_with_warning(&path, &text)
+    }
+
+    /// The resolved config path: `$XDG_CONFIG_HOME/aetherspace/config.toml` (else
+    /// `~/.config/aetherspace/config.toml`). Exposed so the live-reload path can
+    /// re-read the same file `load_with_warning` reads at boot.
+    pub fn config_path() -> PathBuf {
+        xdg::home("XDG_CONFIG_HOME", ".config").join("aetherspace/config.toml")
+    }
+
+    /// Reload variant that ALSO reports whether the file was present. Boot uses
+    /// [`load_with_warning`], which collapses a missing file to `(default, None)` —
+    /// indistinguishable from a clean no-config boot. Live reload must tell those
+    /// apart: a DELETED file must keep current state and warn, not silently wipe
+    /// probes/layouts/keymap back to defaults. The bool is `true` when the file read
+    /// succeeds, `false` when it is absent (or unreadable).
+    pub fn load_present_with_warning() -> (Self, bool, Option<String>) {
+        Self::load_present_from_path(&Self::config_path())
+    }
+
+    /// Path-taking core of [`load_present_with_warning`], split out so the
+    /// file-present decision is unit-testable without mutating `XDG_CONFIG_HOME`
+    /// (which would race across test threads). `false` means the file is absent or
+    /// unreadable (reload must keep current state); `true` means it was read (a
+    /// parse failure is still `true`, paired with a warning).
+    fn load_present_from_path(path: &Path) -> (Self, bool, Option<String>) {
+        let Ok(text) = fs::read_to_string(path) else {
+            return (Self::default(), false, None);
+        };
+        let (cfg, warning) = Self::from_toml_with_warning(path, &text);
+        (cfg, true, warning)
     }
 
     /// Parse `text` from `path`, returning defaults plus a one-line warning when
@@ -777,6 +807,76 @@ mod tests {
             cfg.resolved_keymap.lookup_leader(ev(KeyCode::Char('z'))),
             Some(BindAction::Zoom)
         );
+    }
+
+    #[test]
+    fn reload_swaps_a_rebound_chord() {
+        use crate::keymap::BindAction;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Resolving config A (default) routes leader 'g' to reload; config B rebinds
+        // 'g' to quit. Re-resolving from the new text yields a different action for
+        // 'g' — exactly what a live reload swaps into the running keymap.
+        let ev = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (a, _) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), "");
+        assert_eq!(
+            a.resolved_keymap.lookup_leader(ev(KeyCode::Char('g'))),
+            Some(BindAction::ReloadConfig)
+        );
+        let (b, warning) = Config::from_toml_with_warning(
+            Path::new("/cfg/config.toml"),
+            "[keymap.leader]\ng = \"quit\"\n",
+        );
+        assert_eq!(warning, None);
+        assert_eq!(
+            b.resolved_keymap.lookup_leader(ev(KeyCode::Char('g'))),
+            Some(BindAction::Quit)
+        );
+    }
+
+    #[test]
+    fn reload_failure_keeps_prior_keymap_and_warns() {
+        use crate::keymap::BindAction;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // A reloaded keymap with a bad entry warns AND keeps the valid defaults: the
+        // bad override is dropped, never wedging the rest. (The runtime keeps its
+        // prior keymap entirely on any warning; this pins the resolve-layer half.)
+        let (cfg, warning) = Config::from_toml_with_warning(
+            Path::new("/cfg/config.toml"),
+            "[keymap.leader]\nq = \"no_such_action\"\n",
+        );
+        assert!(warning.is_some(), "a bad keymap entry must warn");
+        let ev = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            cfg.resolved_keymap.lookup_leader(ev(KeyCode::Char('q'))),
+            Some(BindAction::Quit),
+            "the bad override dropped; 'q' keeps its default"
+        );
+        assert_eq!(
+            cfg.resolved_keymap.lookup_leader(ev(KeyCode::Char('z'))),
+            Some(BindAction::Zoom)
+        );
+    }
+
+    #[test]
+    fn load_present_with_warning_reports_present_false_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent file: present == false, no warning (reload must KEEP current state).
+        let (_, present, warning) = Config::load_present_from_path(&tmp.path().join("nope.toml"));
+        assert!(!present, "an absent file is not present");
+        assert!(warning.is_none());
+        // Present + parseable: present == true, no warning.
+        let ok = tmp.path().join("ok.toml");
+        std::fs::write(&ok, "[input]\nleader = \"ctrl-g\"\n").unwrap();
+        let (_, present, warning) = Config::load_present_from_path(&ok);
+        assert!(present);
+        assert!(warning.is_none());
+        // Present + UNPARSEABLE: present == true WITH a warning (NOT treated as vanished,
+        // so the reload warns-and-keeps rather than silently wiping to defaults).
+        let bad = tmp.path().join("bad.toml");
+        std::fs::write(&bad, "not = valid = toml =\n[[[\n").unwrap();
+        let (_, present, warning) = Config::load_present_from_path(&bad);
+        assert!(present, "an unparseable file is present, not vanished");
+        assert!(warning.is_some());
     }
 
     #[test]

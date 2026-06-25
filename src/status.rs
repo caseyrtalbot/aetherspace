@@ -47,7 +47,7 @@ pub(crate) struct StatusDetailRow {
     pub(crate) detail: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatusConfig {
     poll: PollCfg,
     probes: Vec<ProbeEntry>,
@@ -58,6 +58,36 @@ impl StatusConfig {
         Self {
             poll: config.poll.clone(),
             probes: config.probes.clone(),
+        }
+    }
+}
+
+/// A live, swappable handle to the poller's [`StatusConfig`], mirroring
+/// [`StatusTarget`]. The detached poll thread owns the config by value otherwise,
+/// so a live config reload (C3) needs this shared `Arc<Mutex<_>>` to push a new
+/// probe set / cadence in without restarting the thread. Reads happen once per
+/// loop tick (the loop sleeps in ≤250ms slices), never across the HTTP poll.
+#[derive(Debug, Clone)]
+pub(crate) struct StatusConfigHandle(Arc<Mutex<StatusConfig>>);
+
+impl StatusConfigHandle {
+    pub(crate) fn new(config: StatusConfig) -> Self {
+        Self(Arc::new(Mutex::new(config)))
+    }
+
+    pub(crate) fn set(&self, config: StatusConfig) {
+        match self.0.lock() {
+            Ok(mut current) => *current = config,
+            // A poisoned lock still holds the last value; overwrite it rather than
+            // panic, so a reload never wedges the status thread.
+            Err(poisoned) => *poisoned.into_inner() = config,
+        }
+    }
+
+    fn get(&self) -> StatusConfig {
+        match self.0.lock() {
+            Ok(current) => current.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 }
@@ -82,7 +112,7 @@ impl StatusTarget {
 }
 
 pub(crate) fn spawn_status_thread(
-    config: StatusConfig,
+    config: StatusConfigHandle,
     target: StatusTarget,
     notify: Sender<RuntimeEvent>,
 ) {
@@ -90,7 +120,10 @@ pub(crate) fn spawn_status_thread(
 }
 
 struct StatusPoller {
+    /// The last config the poller observed; compared against the live handle each
+    /// tick to detect a reload and reset the poll deadlines.
     config: StatusConfig,
+    config_handle: StatusConfigHandle,
     target: StatusTarget,
     system: System,
     http: ureq::Agent,
@@ -101,13 +134,15 @@ struct StatusPoller {
 }
 
 impl StatusPoller {
-    fn new(config: StatusConfig, target: StatusTarget) -> Self {
+    fn new(config_handle: StatusConfigHandle, target: StatusTarget) -> Self {
         let http_config = ureq::config::Config::builder()
             .timeout_global(Some(HEALTH_TIMEOUT))
             .build();
         let now = Instant::now();
+        let config = config_handle.get();
         Self {
             config,
+            config_handle,
             target,
             system: System::new(),
             http: http_config.into(),
@@ -122,6 +157,11 @@ impl StatusPoller {
         loop {
             let now = Instant::now();
             let mut changed = false;
+
+            // Pick up a live config reload (C3): read the shared handle once per
+            // tick (never across a poll) and, if it changed, reset the deadlines so
+            // the new probe set / cadence applies now rather than at the old one.
+            self.adopt_if_changed(now);
 
             if now >= self.next_system {
                 self.snapshot.system = Some(sample_system(&mut self.system));
@@ -152,6 +192,22 @@ impl StatusPoller {
             let next = self.next_system.min(self.next_git).min(self.next_health);
             let sleep_for = next.saturating_duration_since(Instant::now());
             thread::sleep(sleep_for.min(Duration::from_millis(250)));
+        }
+    }
+
+    /// If the shared config handle differs from the last-observed config, adopt it
+    /// and reset all poll deadlines to `now` so the new probe set / cadence takes
+    /// effect this tick. Returns whether a change was adopted.
+    fn adopt_if_changed(&mut self, now: Instant) -> bool {
+        let live = self.config_handle.get();
+        if live != self.config {
+            self.config = live;
+            self.next_system = now;
+            self.next_git = now;
+            self.next_health = now;
+            true
+        } else {
+            false
         }
     }
 }
@@ -359,5 +415,55 @@ mod tests {
     fn git_sample_ignores_non_repos() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(sample_git(tmp.path()), None);
+    }
+
+    fn status_config(sys: u64, git: u64, health: u64) -> StatusConfig {
+        StatusConfig {
+            poll: PollCfg {
+                sys_secs: sys,
+                git_secs: git,
+                health_secs: health,
+            },
+            probes: vec![],
+        }
+    }
+
+    #[test]
+    fn status_config_handle_set_then_get_roundtrips() {
+        let a = status_config(2, 5, 9);
+        let b = status_config(1, 1, 1);
+        let handle = StatusConfigHandle::new(a.clone());
+        assert_eq!(handle.get(), a);
+        handle.set(b.clone());
+        assert_eq!(
+            handle.get(),
+            b,
+            "a reload's set must be visible to a later get"
+        );
+    }
+
+    #[test]
+    fn set_recomputes_next_deadlines() {
+        // A poller observing config A with deadlines far in the future must reset
+        // those deadlines to `now` the moment the handle swaps to a different config,
+        // so the new cadence/probe set applies this tick rather than at the old one.
+        let handle = StatusConfigHandle::new(status_config(30, 30, 30));
+        let mut poller = StatusPoller::new(handle.clone(), StatusTarget::new(None));
+        let now = Instant::now();
+        let future = now + Duration::from_secs(600);
+        poller.next_system = future;
+        poller.next_git = future;
+        poller.next_health = future;
+
+        // No change yet: deadlines untouched.
+        assert!(!poller.adopt_if_changed(now));
+        assert_eq!(poller.next_system, future);
+
+        // Swap the config: deadlines reset to now.
+        handle.set(status_config(1, 1, 1));
+        assert!(poller.adopt_if_changed(now));
+        assert_eq!(poller.next_system, now);
+        assert_eq!(poller.next_git, now);
+        assert_eq!(poller.next_health, now);
     }
 }

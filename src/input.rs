@@ -803,4 +803,16 @@ mod tests {
             Action::SendBytes(vec![b'\t'])
         );
     }
+
+    #[test]
+    fn rebuilt_router_starts_in_shell_capture() {
+        use std::sync::Arc;
+
+        use crate::keymap::Keymap;
+        // A live config reload rebuilds the router via with_keymap. It MUST start in
+        // shell-capture (not mid-leader), so a reload triggered right after a leader
+        // chord cannot strand the next keypress in leader mode.
+        let router = InputRouter::with_keymap(InputConfig::default(), Arc::new(Keymap::default()));
+        assert_eq!(router.mode_label(), "shell capture");
+    }
 }

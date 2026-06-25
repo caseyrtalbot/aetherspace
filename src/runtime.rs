@@ -32,7 +32,7 @@ use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
 use crate::session::{PaneId, PaneSpec, ProjectSelection, Session};
 use crate::session_store;
-use crate::status::{self, StatusSnapshot, StatusTarget};
+use crate::status::{self, StatusConfigHandle, StatusSnapshot, StatusTarget};
 use crate::terminal::TerminalGuard;
 use crate::theme::Theme;
 
@@ -57,6 +57,9 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let projects = config.resolve_projects();
     let status_config = status::StatusConfig::from_config(&config);
+    // Shared handle so a live config reload can swap the poll cadence / probe set
+    // into the detached status thread without restarting it (C3).
+    let status_config_handle = StatusConfigHandle::new(status_config);
     let InitialSession {
         session,
         selected: selected_project,
@@ -91,6 +94,7 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
         default_viewer: config.workflow.default_viewer.clone(),
         layouts: config.layouts.clone(),
         status_target: status_target.clone(),
+        status_config_handle: status_config_handle.clone(),
         config_warning: config_warning.clone(),
         nest_depth,
         session_persist,
@@ -115,6 +119,7 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
                 default_viewer: config.workflow.default_viewer,
                 layouts: config.layouts,
                 status_target: status_target.clone(),
+                status_config_handle: status_config_handle.clone(),
                 config_warning,
                 nest_depth,
                 session_persist,
@@ -126,7 +131,7 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
     let mut guard = TerminalGuard::enter();
     panic_after_terminal_for_smoke();
     spawn_input_thread(tx);
-    status::spawn_status_thread(status_config, status_target, app.notify.clone());
+    status::spawn_status_thread(status_config_handle, status_target, app.notify.clone());
 
     let result = run_loop(&mut guard, &mut app, rx);
     // Refuse-to-clobber: an Incompatible boot set session_persist=false, so the
@@ -197,6 +202,9 @@ struct RuntimeApp {
     session_persist: bool,
     status: StatusSnapshot,
     status_target: StatusTarget,
+    /// Live handle into the detached status thread's config. A reload pushes a new
+    /// poll cadence / probe set here without restarting the thread.
+    status_config_handle: StatusConfigHandle,
     /// Nesting depth this process is AT (0 = top-level). Drives the `nested:N`
     /// statusline span; the child env var is already incremented at boot.
     nest_depth: u32,
@@ -218,6 +226,7 @@ struct RuntimeAppInit {
     default_viewer: PathBuf,
     layouts: Vec<NamedLayout>,
     status_target: StatusTarget,
+    status_config_handle: StatusConfigHandle,
     config_warning: Option<String>,
     nest_depth: u32,
     /// False after an Incompatible boot: every save call site is gated on this so
@@ -255,6 +264,7 @@ enum PaletteCommand {
     ToggleCompact,
     Restart,
     Close,
+    ReloadConfig,
     Quit,
 }
 
@@ -279,9 +289,7 @@ struct Banner {
 enum BannerTone {
     /// A keybind/config conflict surfaced at load or reload.
     Conflict,
-    /// A hard error (e.g. a vanished config file on reload). Constructed by the C3
-    /// reload path; defined here so the banner model is complete in C2.
-    #[allow(dead_code)]
+    /// A hard error (e.g. a vanished config file on reload).
     Error,
 }
 
@@ -364,6 +372,11 @@ const COMMAND_ITEMS: &[CommandItem] = &[
         detail: "close focused pane",
     },
     CommandItem {
+        command: PaletteCommand::ReloadConfig,
+        label: "reload config",
+        detail: "re-read config.toml (keymap/layouts/probes)",
+    },
+    CommandItem {
         command: PaletteCommand::Quit,
         label: "quit",
         detail: "restore terminal and exit",
@@ -413,6 +426,7 @@ impl RuntimeApp {
             session_persist: init.session_persist,
             status: StatusSnapshot::default(),
             status_target: init.status_target,
+            status_config_handle: init.status_config_handle,
             nest_depth: init.nest_depth,
             pending_editor: None,
         })
@@ -654,6 +668,59 @@ impl RuntimeApp {
     fn open_help(&mut self) {
         self.palette = None;
         self.show_help = true;
+    }
+
+    /// Live config reload (C3): re-read config.toml without a restart. A vanished or
+    /// unparseable file KEEPS the current in-memory state and shows an error banner —
+    /// never a silent wipe to defaults. On success, rebuild the ONE shared keymap +
+    /// input router (so they cannot diverge), swap in the new layouts, and push the
+    /// new poll/probe config into the detached status thread. Theme is compile-time
+    /// (not reloadable); reloaded layouts affect only FUTURE `apply_layout` calls,
+    /// not the live tree.
+    fn reload_config(&mut self) -> bool {
+        let (config, present, warning) = Config::load_present_with_warning();
+        match plan_reload(config, present, warning) {
+            // Vanished file or a parse/keymap/layout/conflict warning: KEEP all
+            // current in-memory state, surface the banner. Never a silent wipe.
+            ReloadPlan::Keep(banner) => {
+                self.set_banner(banner);
+                self.last_notice = None;
+            }
+            // Clean reload: rebuild the ONE shared keymap (so the input router and
+            // the renderers cannot diverge), swap layouts, push the new poll/probe
+            // config into the status thread. Layouts affect only future apply_layout;
+            // theme is compile-time and not reloaded.
+            ReloadPlan::Apply(config) => {
+                let keymap = Arc::new(config.resolved_keymap.clone());
+                self.input = InputRouter::with_keymap(
+                    InputConfig::from_leader_name(&config.input.leader),
+                    keymap.clone(),
+                );
+                self.keymap = keymap;
+                self.layouts = config.layouts.clone();
+                self.status_config_handle
+                    .set(status::StatusConfig::from_config(&config));
+                self.clear_banner();
+                self.last_error = None;
+                self.last_notice = Some("config reloaded".to_string());
+            }
+        }
+        true
+    }
+
+    /// Show a reserved-row banner and resize so the child PTY winsize tracks the
+    /// newly reserved row (a banner set AFTER boot changes the geometry, unlike the
+    /// boot banner which is in place before the first resize).
+    fn set_banner(&mut self, banner: Banner) {
+        self.banner = Some(banner);
+        self.resize_to_area(self.last_area);
+    }
+
+    /// Clear the banner (if any) and resize so the freed row returns to the panes.
+    fn clear_banner(&mut self) {
+        if self.banner.take().is_some() {
+            self.resize_to_area(self.last_area);
+        }
     }
 
     fn reset_workspace(&mut self) -> Result<()> {
@@ -1061,6 +1128,7 @@ impl RuntimeApp {
             PaletteCommand::ToggleCompact => apply_action(self, Action::ToggleCompactChrome),
             PaletteCommand::Restart => apply_action(self, Action::RestartFocusedPane),
             PaletteCommand::Close => apply_action(self, Action::CloseFocusedPane),
+            PaletteCommand::ReloadConfig => apply_action(self, Action::ReloadConfig),
             PaletteCommand::Quit => apply_action(self, Action::Quit),
         }
     }
@@ -1441,8 +1509,36 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             app.edit_scrollback();
             true
         }
+        Action::ReloadConfig => app.reload_config(),
         Action::Noop => dirty,
     }
+}
+
+/// The decision half of a config reload, split from the state mutation in
+/// [`RuntimeApp::reload_config`] so the keep-vs-apply SAFETY logic is unit-testable
+/// without constructing a `RuntimeApp` (which would spawn PTYs). `present`/`warning`
+/// come from [`Config::load_present_with_warning`]: a missing file or any warning
+/// means KEEP current state (never apply a partial/default config); only a clean
+/// load applies.
+enum ReloadPlan {
+    Keep(Banner),
+    Apply(Box<Config>),
+}
+
+fn plan_reload(config: Config, present: bool, warning: Option<String>) -> ReloadPlan {
+    if !present {
+        return ReloadPlan::Keep(Banner {
+            text: "config file missing — keeping current settings".to_string(),
+            tone: BannerTone::Error,
+        });
+    }
+    if let Some(reason) = warning {
+        return ReloadPlan::Keep(Banner {
+            text: reason,
+            tone: BannerTone::Conflict,
+        });
+    }
+    ReloadPlan::Apply(Box::new(config))
 }
 
 fn draw(frame: &mut Frame, app: &RuntimeApp) {
@@ -1725,6 +1821,7 @@ fn bind_action_word(action: BindAction) -> &'static str {
         BindAction::ToggleStack => "stack",
         BindAction::ToggleCompact => "compact",
         BindAction::EditScrollback => "edit",
+        BindAction::ReloadConfig => "reload",
     }
 }
 
@@ -2438,6 +2535,28 @@ mod tests {
         assert_eq!(banner_rect(area, 1, true), Rect::new(0, 0, 80, 1));
         assert_eq!(workspace_rect(area, 1, true), Rect::new(0, 1, 80, 23));
         assert_eq!(status_rect(area, 1, true).height, 0);
+    }
+
+    #[test]
+    fn reload_plan_keeps_state_on_vanished_or_warning_applies_on_clean() {
+        // The state-safety guarantee: a vanished file or any warning must KEEP the
+        // current config (a Banner, never Apply), so reload can never silently wipe
+        // the live keymap/layouts/probes. Only a clean load applies.
+        match plan_reload(Config::default(), false, None) {
+            ReloadPlan::Keep(b) => assert_eq!(b.tone, BannerTone::Error),
+            ReloadPlan::Apply(_) => panic!("a vanished file must KEEP state, not apply"),
+        }
+        match plan_reload(Config::default(), true, Some("dup chord".to_string())) {
+            ReloadPlan::Keep(b) => {
+                assert_eq!(b.tone, BannerTone::Conflict);
+                assert_eq!(b.text, "dup chord");
+            }
+            ReloadPlan::Apply(_) => panic!("a warning must KEEP state, not apply"),
+        }
+        match plan_reload(Config::default(), true, None) {
+            ReloadPlan::Apply(_) => {}
+            ReloadPlan::Keep(_) => panic!("a clean load must apply"),
+        }
     }
 
     #[test]

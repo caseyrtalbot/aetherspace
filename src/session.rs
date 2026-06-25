@@ -16,8 +16,27 @@ use crate::layout::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct PaneId(pub(crate) u64);
 
+/// The session-format version this binary writes and the highest it can read.
+/// Bumped when the serialized shape changes in a way an older binary cannot
+/// faithfully read (B2 raises this to 2 for `TileNode::Stack`). The load guard in
+/// `session_store` refuses to overwrite a file whose `format_version` exceeds this.
+pub(crate) const CURRENT_SESSION_FORMAT: u32 = 1;
+
+/// `#[serde(default)]` target for `format_version`. Returns 1 (NOT 0) on purpose:
+/// every `session.toml` written before the guard lacks the key and is a legitimate
+/// version-1 file, so a missing field must classify as 1, the pre-guard baseline.
+fn session_format_v1() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Session {
+    /// Serialized FIRST so a leading scalar precedes the `[floating.N]` tables.
+    /// The default is load-bearing: without it every pre-guard file becomes a
+    /// parse error the load path silently drops, triggering the exact data loss
+    /// the guard exists to prevent.
+    #[serde(default = "session_format_v1")]
+    format_version: u32,
     panes: Vec<PaneSpec>,
     focused: Option<PaneId>,
     next_pane_id: u64,
@@ -39,6 +58,7 @@ impl Session {
     ) -> Self {
         let id = PaneId(0);
         Self {
+            format_version: CURRENT_SESSION_FORMAT,
             panes: vec![PaneSpec::shell(id, cwd)],
             focused: Some(id),
             next_pane_id: 1,
@@ -47,6 +67,10 @@ impl Session {
             zoomed: None,
             selected_project,
         }
+    }
+
+    pub(crate) fn format_version(&self) -> u32 {
+        self.format_version
     }
 
     pub(crate) fn pane_specs(&self) -> &[PaneSpec] {
@@ -319,6 +343,12 @@ pub(crate) struct ProjectSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_session_carries_current_format_version() {
+        let session = Session::single_shell(PathBuf::from("/work/project"));
+        assert_eq!(session.format_version(), CURRENT_SESSION_FORMAT);
+    }
 
     #[test]
     fn single_shell_session_has_serializable_spec_not_runtime_state() {

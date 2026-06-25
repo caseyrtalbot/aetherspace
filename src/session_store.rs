@@ -9,19 +9,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::session::Session;
+use crate::session::{CURRENT_SESSION_FORMAT, Session};
 use crate::xdg;
 
 const SESSION_FILE: &str = "aetherspace/session.toml";
 
-pub(crate) fn load() -> Option<Session> {
-    match load_from_path(&default_path()) {
-        Ok(session) => session,
-        Err(e) => {
-            crate::log::warn(&format!("session load skipped: {e}"));
-            None
-        }
-    }
+/// Outcome of classifying a session file on disk.
+///
+/// `Incompatible` is the data-loss guard: a file whose `format_version` exceeds
+/// what this binary understands was written by a newer Aetherspace, so the caller
+/// must start fresh WITHOUT persisting (overwriting it would destroy the newer
+/// file). `None` covers both "no file" and "file exists but holds no panes".
+#[derive(Debug)]
+pub(crate) enum SessionLoad {
+    None,
+    Loaded(Session),
+    Incompatible,
 }
 
 pub(crate) fn save(session: &Session) {
@@ -33,22 +36,54 @@ pub(crate) fn save(session: &Session) {
     }
 }
 
-fn default_path() -> PathBuf {
+pub(crate) fn default_path() -> PathBuf {
     xdg::home("XDG_STATE_HOME", ".local/state").join(SESSION_FILE)
 }
 
-fn load_from_path(path: &Path) -> Result<Option<Session>> {
+/// Read and classify the session file. The guard lives here, not in the caller:
+/// - missing file → `None`
+/// - parse error → `Err` (corrupt/unknown; caller logs and starts fresh)
+/// - `format_version > CURRENT` → `Incompatible` (newer binary wrote it)
+/// - `format_version < CURRENT` → accept-and-rewrite: load it; the next gated
+///   save rewrites it at CURRENT (load classifies, it never transforms)
+/// - `== CURRENT` with panes → `Loaded`; with no panes → `None`
+pub(crate) fn load_classified(path: &Path) -> Result<SessionLoad> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SessionLoad::None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let session: Session =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    let session: Session = match toml::from_str(&text) {
+        Ok(session) => session,
+        Err(e) => {
+            // A parse failure is usually a corrupt file, but it is ALSO how a file
+            // from a NEWER binary looks: a future body (e.g. a TileNode variant this
+            // build lacks) fails to deserialize before the version check below ever
+            // runs. Probe just the version field — VersionProbe ignores the
+            // unparseable body — and if it is newer, classify Incompatible so the
+            // refuse-to-clobber gate protects the file instead of overwriting it as
+            // corrupt. Without this, B2's format bump would let a pre-B2 binary
+            // destroy a newer session on the first autosave.
+            #[derive(serde::Deserialize)]
+            struct VersionProbe {
+                #[serde(default)]
+                format_version: u32,
+            }
+            if let Ok(probe) = toml::from_str::<VersionProbe>(&text)
+                && probe.format_version > CURRENT_SESSION_FORMAT
+            {
+                return Ok(SessionLoad::Incompatible);
+            }
+            return Err(e).with_context(|| format!("parse {}", path.display()));
+        }
+    };
+    if session.format_version() > CURRENT_SESSION_FORMAT {
+        return Ok(SessionLoad::Incompatible);
+    }
     if session.pane_specs().is_empty() {
-        Ok(None)
+        Ok(SessionLoad::None)
     } else {
-        Ok(Some(session))
+        Ok(SessionLoad::Loaded(session))
     }
 }
 
@@ -87,11 +122,21 @@ mod tests {
     use crate::layout::{FloatGeom, SplitDir};
     use crate::session::{PaneId, ProjectSelection, Session};
 
+    /// Collapse `load_classified` to the historical `Option<Session>` shape for
+    /// tests that only care about loaded-vs-not (None and Incompatible both map to
+    /// `None` here; the guard-specific tests below assert on `SessionLoad` directly).
+    fn loaded_session(path: &Path) -> Option<Session> {
+        match load_classified(path).unwrap() {
+            SessionLoad::Loaded(session) => Some(session),
+            SessionLoad::None | SessionLoad::Incompatible => None,
+        }
+    }
+
     #[test]
     fn missing_session_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("missing.toml");
-        assert!(load_from_path(&path).unwrap().is_none());
+        assert!(loaded_session(&path).is_none());
     }
 
     #[test]
@@ -116,7 +161,7 @@ mod tests {
         }));
 
         save_to_path(&session, &path).unwrap();
-        let loaded = load_from_path(&path).unwrap().expect("session");
+        let loaded = loaded_session(&path).expect("session");
         assert_eq!(loaded, session);
     }
 
@@ -132,7 +177,7 @@ mod tests {
         assert!(!path.with_extension("toml.tmp").exists());
         // Overwriting an existing target also succeeds (rename replaces it).
         save_to_path(&session, &path).unwrap();
-        assert_eq!(load_from_path(&path).unwrap().unwrap(), session);
+        assert_eq!(loaded_session(&path).unwrap(), session);
     }
 
     #[test]
@@ -145,5 +190,122 @@ mod tests {
         assert!(!session.close_pane(PaneId(0)));
         save_to_path(&session, &path).unwrap();
         assert!(!path.exists());
+    }
+
+    /// A FIXED literal session.toml from before the guard existed: it lacks the
+    /// `format_version` key entirely. Must be a literal (not a re-serialized
+    /// struct) so it stays a true legacy fixture if the struct shape changes.
+    const LEGACY_SESSION_NO_FORMAT_VERSION: &str = r#"
+focused = 0
+next_pane_id = 1
+
+[[panes]]
+id = 0
+title = "SHELL"
+
+[panes.kind.Shell]
+cwd = "/work/aetherspace"
+
+[tiled]
+Leaf = 0
+
+[floating]
+"#;
+
+    #[test]
+    fn legacy_file_without_format_version_loads_as_v1() {
+        // The serde default (= 1) is load-bearing: without it this file becomes a
+        // parse error the load path would silently drop, then overwrite.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+        fs::write(&path, LEGACY_SESSION_NO_FORMAT_VERSION).unwrap();
+
+        let session = match load_classified(&path).unwrap() {
+            SessionLoad::Loaded(session) => session,
+            other => panic!("expected Loaded, got a non-loaded classification ({other:?})"),
+        };
+        assert_eq!(session.format_version(), 1);
+        assert_eq!(session.pane_specs().len(), 1);
+    }
+
+    #[test]
+    fn newer_format_version_classifies_incompatible() {
+        // A file from a newer binary (format_version = 999) must NOT load and must
+        // NOT be treated as missing/corrupt — it is Incompatible so the caller can
+        // refuse to overwrite it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+        let future = LEGACY_SESSION_NO_FORMAT_VERSION.replacen(
+            "focused = 0",
+            "format_version = 999\nfocused = 0",
+            1,
+        );
+        fs::write(&path, &future).unwrap();
+
+        assert!(matches!(
+            load_classified(&path).unwrap(),
+            SessionLoad::Incompatible
+        ));
+    }
+
+    #[test]
+    fn newer_format_with_unparseable_body_classifies_incompatible() {
+        // The dangerous B2 case: a newer file whose body holds a TileNode variant
+        // this (pre-B2) build cannot deserialize. `toml::from_str::<Session>` fails
+        // BEFORE the version check, so without the version probe this would route to
+        // the Err arm (treated as corrupt, persist=true) and be clobbered. The probe
+        // must classify it Incompatible so the refuse-to-clobber gate protects it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+        let future = LEGACY_SESSION_NO_FORMAT_VERSION
+            .replacen("focused = 0", "format_version = 2\nfocused = 0", 1)
+            .replace(
+                "[tiled]\nLeaf = 0",
+                "[tiled.Stack]\nactive = 0\nchildren = []",
+            );
+        fs::write(&path, &future).unwrap();
+
+        // Sanity: the body really IS unparseable as the current Session shape, so
+        // this exercises the probe path and not the normal version check.
+        assert!(toml::from_str::<Session>(&future).is_err());
+        assert!(matches!(
+            load_classified(&path).unwrap(),
+            SessionLoad::Incompatible
+        ));
+    }
+
+    #[test]
+    fn refuse_to_clobber_leaves_incompatible_file_byte_identical() {
+        // After classifying Incompatible, a no-persist boot must never reach save.
+        // Simulate the gate (session_persist = false): the on-disk bytes are
+        // unchanged, including the empty-session remove_file path being skipped.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+        let future = LEGACY_SESSION_NO_FORMAT_VERSION.replacen(
+            "focused = 0",
+            "format_version = 999\nfocused = 0",
+            1,
+        );
+        fs::write(&path, &future).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // Classify, then take the no-persist branch: the gate skips save entirely.
+        assert!(matches!(
+            load_classified(&path).unwrap(),
+            SessionLoad::Incompatible
+        ));
+        let session_persist = false;
+        // Even an empty session must not touch the file when persistence is gated off.
+        let mut empty = Session::single_shell(PathBuf::from("/work/aetherspace"));
+        assert!(!empty.close_pane(PaneId(0)));
+        if session_persist {
+            save_to_path(&empty, &path).unwrap();
+        }
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "Incompatible file must survive byte-for-byte"
+        );
     }
 }

@@ -13,7 +13,13 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 
+use crate::layout::SplitDir;
 use crate::xdg;
+
+/// The largest split ratio a layout step may request (the first child's percentage
+/// of the parent split). `split_rects` clamps to 1..=99, so anything outside that
+/// is a config mistake worth naming rather than silently coercing.
+const MAX_LAYOUT_RATIO: u16 = 99;
 
 /// Top-level config. `#[serde(default)]` fills any missing field from
 /// `Config::default()`, so a partial TOML table still parses cleanly.
@@ -35,6 +41,15 @@ pub struct Config {
     pub input: InputCfg,
     /// Workflow defaults for startup project and contextual viewer documents.
     pub workflow: WorkflowCfg,
+    /// Raw `[[layouts]]` tables, kept as untyped values so a malformed layout
+    /// names itself in a warning instead of failing the whole config parse. The
+    /// resolved, validated form lives in [`Config::layouts`] (filled post-parse).
+    #[serde(rename = "layouts")]
+    raw_layouts: Vec<toml::Value>,
+    /// Validated named layouts the runtime replays. Populated by
+    /// [`from_toml_with_warning`] from [`raw_layouts`]; never set by serde.
+    #[serde(skip)]
+    pub layouts: Vec<NamedLayout>,
 }
 
 impl Default for Config {
@@ -47,8 +62,148 @@ impl Default for Config {
             shell: ShellCfg::default(),
             input: InputCfg::default(),
             workflow: WorkflowCfg::default(),
+            raw_layouts: Vec::new(),
+            layouts: Vec::new(),
         }
     }
+}
+
+/// A named, ordered SCRIPT of split/focus steps applied at runtime. Replayed
+/// through the existing actions, so each step reuses proven PTY-spawn machinery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedLayout {
+    pub name: String,
+    pub steps: Vec<LayoutStep>,
+}
+
+/// One step in a layout script. Linear grammar: split the focused leaf (ratio
+/// rides the split, applied at creation) or move relative focus. No new action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutStep {
+    Split { dir: SplitDir, ratio: Option<u16> },
+    Focus { dir: FocusDir },
+}
+
+/// Relative focus direction for a `Focus` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusDir {
+    Next,
+    Prev,
+}
+
+/// Config-facing split direction. Separate from `layout::SplitDir` only to accept
+/// lowercase strings (`"horizontal"`): `SplitDir`'s own Deserialize is PascalCase
+/// because it drives the session.toml wire format, which B1 must not change.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConfigSplitDir {
+    Horizontal,
+    Vertical,
+}
+
+impl From<ConfigSplitDir> for SplitDir {
+    fn from(dir: ConfigSplitDir) -> Self {
+        match dir {
+            ConfigSplitDir::Horizontal => SplitDir::Horizontal,
+            ConfigSplitDir::Vertical => SplitDir::Vertical,
+        }
+    }
+}
+
+/// Untyped raw step keyed on the present field. `deny_unknown_fields` makes a
+/// typo'd key ("splt") name itself in the error rather than silently parsing as a
+/// no-op. Not `#[serde(untagged)]`: untagged collapses every key error into a
+/// useless "did not match any variant", defeating the warning's DevEx.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLayoutStep {
+    #[serde(default)]
+    split: Option<ConfigSplitDir>,
+    #[serde(default)]
+    ratio: Option<u16>,
+    #[serde(default)]
+    focus: Option<FocusDir>,
+}
+
+/// Untyped raw layout. Parsed separately from the main config so a single bad
+/// layout yields a warning instead of failing the whole file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNamedLayout {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    steps: Vec<RawLayoutStep>,
+}
+
+/// Validate one raw `[[layouts]]` value into a [`NamedLayout`], or a one-line
+/// warning that names the offending layout. The name is read best-effort from the
+/// raw value FIRST (falling back to a 1-based index) so even a structural/serde
+/// error — a typo'd key or a bad direction string — still names which layout it
+/// came from. Semantic errors (empty name/steps, ratio out of range, neither-or-
+/// both of split/focus) are named here.
+fn resolve_layout(index: usize, value: &toml::Value) -> Result<NamedLayout, String> {
+    // Best-effort label for messages: the declared name if present, else the index.
+    let label = value
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("layout '{name}'"))
+        .unwrap_or_else(|| format!("layout #{}", index + 1));
+
+    let raw: RawNamedLayout = value
+        .clone()
+        .try_into()
+        .map_err(|e| format!("{label}: {e}"))?;
+    if raw.name.trim().is_empty() {
+        return Err(format!("{label}: empty name"));
+    }
+    if raw.steps.is_empty() {
+        return Err(format!("{label}: no steps"));
+    }
+    let mut steps = Vec::with_capacity(raw.steps.len());
+    for (step_index, raw_step) in raw.steps.iter().enumerate() {
+        let step_pos = step_index + 1;
+        let step = match (raw_step.split, raw_step.focus) {
+            (Some(dir), None) => {
+                if let Some(ratio) = raw_step.ratio
+                    && !(1..=MAX_LAYOUT_RATIO).contains(&ratio)
+                {
+                    return Err(format!(
+                        "{label} step {step_pos}: ratio {ratio} out of range 1..={MAX_LAYOUT_RATIO}"
+                    ));
+                }
+                LayoutStep::Split {
+                    dir: dir.into(),
+                    ratio: raw_step.ratio,
+                }
+            }
+            (None, Some(dir)) => {
+                if raw_step.ratio.is_some() {
+                    return Err(format!(
+                        "{label} step {step_pos}: ratio is only valid on a split"
+                    ));
+                }
+                LayoutStep::Focus { dir }
+            }
+            (None, None) => {
+                return Err(format!(
+                    "{label} step {step_pos}: needs a split or focus key"
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "{label} step {step_pos}: cannot set both split and focus"
+                ));
+            }
+        };
+        steps.push(step);
+    }
+    Ok(NamedLayout {
+        name: raw.name,
+        steps,
+    })
 }
 
 /// A pinned project: a display name and its directory.
@@ -173,14 +328,41 @@ impl Config {
     /// in [`load_with_warning`] so the warning decision is unit-testable without
     /// mutating process environment (which would race across test threads).
     fn from_toml_with_warning(path: &Path, text: &str) -> (Self, Option<String>) {
-        match toml::from_str(text) {
-            Ok(cfg) => (cfg, None),
+        match toml::from_str::<Self>(text) {
+            Ok(mut cfg) => {
+                let warning = cfg.resolve_layouts();
+                (cfg, warning)
+            }
             Err(e) => {
                 crate::log::warn(&format!("config parse error, using defaults: {e}"));
                 let warning = format!("config {} parse error, using defaults", path.display());
                 (Self::default(), Some(warning))
             }
         }
+    }
+
+    /// Validate `raw_layouts` into `layouts`, dropping any malformed layout and
+    /// returning a one-line warning that names the first offender. The rest of the
+    /// config (and the valid layouts) survive: a typo never wedges the whole file.
+    fn resolve_layouts(&mut self) -> Option<String> {
+        let mut resolved = Vec::with_capacity(self.raw_layouts.len());
+        let mut first_warning = None;
+        for (index, value) in self.raw_layouts.iter().enumerate() {
+            match resolve_layout(index, value) {
+                Ok(layout) => resolved.push(layout),
+                Err(reason) => {
+                    // serde errors can span lines ("...\nin `steps`"); flatten to a
+                    // single line so the banner honors the one-line warning contract.
+                    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+                    crate::log::warn(&format!("layout config: {reason}"));
+                    if first_warning.is_none() {
+                        first_warning = Some(format!("config layout error: {reason}"));
+                    }
+                }
+            }
+        }
+        self.layouts = resolved;
+        first_warning
     }
 
     /// Parse TOML, falling back to defaults (with a logged warning) on any parse
@@ -359,6 +541,174 @@ mod tests {
             Config::from_toml_with_warning(Path::new("/cfg/config.toml"), "projects_root = \"/x\"");
         assert_eq!(cfg.projects_root, PathBuf::from("/x"));
         assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn parses_layouts_into_step_sequence() {
+        let toml = r#"
+            [[layouts]]
+            name = "dev"
+            steps = [
+              { split = "horizontal", ratio = 65 },
+              { split = "vertical" },
+            ]
+        "#;
+        let cfg = Config::from_toml_or_default(toml);
+        assert_eq!(cfg.layouts.len(), 1);
+        let dev = &cfg.layouts[0];
+        assert_eq!(dev.name, "dev");
+        assert_eq!(
+            dev.steps,
+            vec![
+                LayoutStep::Split {
+                    dir: SplitDir::Horizontal,
+                    ratio: Some(65),
+                },
+                LayoutStep::Split {
+                    dir: SplitDir::Vertical,
+                    ratio: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_focus_step() {
+        let toml = r#"
+            [[layouts]]
+            name = "scan"
+            steps = [
+              { split = "horizontal" },
+              { focus = "prev" },
+            ]
+        "#;
+        let cfg = Config::from_toml_or_default(toml);
+        assert_eq!(
+            cfg.layouts[0].steps,
+            vec![
+                LayoutStep::Split {
+                    dir: SplitDir::Horizontal,
+                    ratio: None,
+                },
+                LayoutStep::Focus {
+                    dir: FocusDir::Prev
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn absent_layouts_yield_empty_vec_no_warning() {
+        let (cfg, warning) =
+            Config::from_toml_with_warning(Path::new("/cfg/config.toml"), "projects_root = \"/x\"");
+        assert!(cfg.layouts.is_empty());
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn typoed_step_key_warns_and_names_layout_rest_defaults() {
+        // `splt` is a typo of `split`: deny_unknown_fields names the bad key, and
+        // the layout is dropped while the rest of the config still parses.
+        let toml = r#"
+            projects_root = "/srv/code"
+
+            [[layouts]]
+            name = "dev"
+            steps = [
+              { splt = "horizontal" },
+            ]
+        "#;
+        let (cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        let warning = warning.expect("typo'd key must warn");
+        assert!(
+            warning.contains("dev"),
+            "warning must name the layout: {warning}"
+        );
+        assert!(
+            warning.contains("splt"),
+            "warning must name the bad key: {warning}"
+        );
+        assert!(!warning.contains('\n'), "one line: {warning}");
+        // Rest of config survives; the malformed layout is dropped.
+        assert_eq!(cfg.projects_root, PathBuf::from("/srv/code"));
+        assert!(cfg.layouts.is_empty());
+    }
+
+    #[test]
+    fn bad_split_direction_warns_and_names_layout() {
+        let toml = r#"
+            [[layouts]]
+            name = "dev"
+            steps = [
+              { split = "sideways" },
+            ]
+        "#;
+        let (cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        let warning = warning.expect("bad split direction must warn");
+        assert!(
+            warning.contains("dev"),
+            "warning must name the layout: {warning}"
+        );
+        assert!(cfg.layouts.is_empty());
+    }
+
+    #[test]
+    fn empty_name_or_steps_warns() {
+        let empty_name = r#"
+            [[layouts]]
+            name = ""
+            steps = [ { split = "horizontal" } ]
+        "#;
+        let (cfg, warning) =
+            Config::from_toml_with_warning(Path::new("/cfg/config.toml"), empty_name);
+        assert!(warning.expect("empty name warns").contains("empty name"));
+        assert!(cfg.layouts.is_empty());
+
+        let empty_steps = r#"
+            [[layouts]]
+            name = "dev"
+            steps = []
+        "#;
+        let (cfg, warning) =
+            Config::from_toml_with_warning(Path::new("/cfg/config.toml"), empty_steps);
+        let warning = warning.expect("empty steps warns");
+        assert!(warning.contains("dev"), "{warning}");
+        assert!(warning.contains("no steps"), "{warning}");
+        assert!(cfg.layouts.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_ratio_warns_and_names_layout() {
+        let toml = r#"
+            [[layouts]]
+            name = "dev"
+            steps = [ { split = "horizontal", ratio = 150 } ]
+        "#;
+        let (cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        let warning = warning.expect("out-of-range ratio must warn");
+        assert!(warning.contains("dev"), "{warning}");
+        assert!(warning.contains("ratio"), "{warning}");
+        assert!(cfg.layouts.is_empty());
+    }
+
+    #[test]
+    fn valid_layout_alongside_invalid_keeps_the_valid_one() {
+        // The first layout is valid; the second is malformed. The valid one
+        // survives and the warning names the offender.
+        let toml = r#"
+            [[layouts]]
+            name = "good"
+            steps = [ { split = "horizontal" } ]
+
+            [[layouts]]
+            name = "bad"
+            steps = [ { split = "horizontal", ratio = 0 } ]
+        "#;
+        let (cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        assert_eq!(cfg.layouts.len(), 1);
+        assert_eq!(cfg.layouts[0].name, "good");
+        let warning = warning.expect("the bad layout must warn");
+        assert!(warning.contains("bad"), "{warning}");
     }
 
     #[test]

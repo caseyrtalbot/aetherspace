@@ -23,7 +23,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::Action;
-use crate::config::{Config, Project};
+use crate::config::{Config, LayoutStep, NamedLayout, Project};
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::input::{InputConfig, InputRouter, encode_mouse};
 use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
@@ -55,8 +55,21 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let projects = config.resolve_projects();
     let status_config = status::StatusConfig::from_config(&config);
-    let (session, selected_project, restored_session) =
-        initial_session(&projects, config.workflow.startup_project.as_deref(), &cwd);
+    let InitialSession {
+        session,
+        selected: selected_project,
+        restored: restored_session,
+        persist: session_persist,
+        warning: session_warning,
+    } = initial_session(
+        &session_store::default_path(),
+        &projects,
+        config.workflow.startup_project.as_deref(),
+        &cwd,
+    );
+    // Fold the Incompatible banner into the single config-warning sink so the
+    // existing keypress-cleared banner surfaces it without a parallel channel.
+    let config_warning = merge_warnings(config_warning, session_warning);
     let status_target = StatusTarget::new(selected_project_path(&projects, selected_project));
     let scrollback = config.shell.scrollback;
     let mut app = match RuntimeApp::new(RuntimeAppInit {
@@ -67,9 +80,11 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
         projects: projects.clone(),
         selected_project,
         default_viewer: config.workflow.default_viewer.clone(),
+        layouts: config.layouts.clone(),
         status_target: status_target.clone(),
         config_warning: config_warning.clone(),
         nest_depth,
+        session_persist,
     }) {
         Ok(app) => app,
         Err(e) if restored_session => {
@@ -85,9 +100,11 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
                 projects,
                 selected_project,
                 default_viewer: config.workflow.default_viewer,
+                layouts: config.layouts,
                 status_target: status_target.clone(),
                 config_warning,
                 nest_depth,
+                session_persist,
             })?
         }
         Err(e) => return Err(e),
@@ -99,9 +116,24 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
     status::spawn_status_thread(status_config, status_target, app.notify.clone());
 
     let result = run_loop(&mut guard, &mut app, rx);
-    session_store::save(&app.session);
+    // Refuse-to-clobber: an Incompatible boot set session_persist=false, so the
+    // final save is skipped entirely (never reaching save_to_path, which would
+    // remove the file on an empty session).
+    if app.session_persist {
+        session_store::save(&app.session);
+    }
     app.shutdown();
     result
+}
+
+/// Combine two optional one-line warnings into the single banner sink. Both
+/// present → joined with `" | "`; otherwise whichever is `Some` (or `None`).
+fn merge_warnings(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
 }
 
 fn panic_after_terminal_for_smoke() {
@@ -119,6 +151,7 @@ struct RuntimeApp {
     projects: Vec<Project>,
     selected_project: Option<usize>,
     default_viewer: PathBuf,
+    layouts: Vec<NamedLayout>,
     palette: Option<Palette>,
     show_help: bool,
     compact_chrome: bool,
@@ -136,6 +169,10 @@ struct RuntimeApp {
     /// the reboot-durable autosave in `run_loop`. NEVER set on SendBytes/Pty/
     /// Render/terminal-driven Resize: typing in a shell must not thrash the disk.
     session_dirty: bool,
+    /// Gate for every save call site. Set false only by an Incompatible boot; the
+    /// gate lives at the call sites in `run()`/`run_loop`, NEVER inside
+    /// `save_to_path` (which removes the file on an empty session).
+    session_persist: bool,
     status: StatusSnapshot,
     status_target: StatusTarget,
     /// Nesting depth this process is AT (0 = top-level). Drives the `nested:N`
@@ -156,9 +193,13 @@ struct RuntimeAppInit {
     projects: Vec<Project>,
     selected_project: Option<usize>,
     default_viewer: PathBuf,
+    layouts: Vec<NamedLayout>,
     status_target: StatusTarget,
     config_warning: Option<String>,
     nest_depth: u32,
+    /// False after an Incompatible boot: every save call site is gated on this so
+    /// the newer on-disk file is never overwritten (or removed on empty).
+    session_persist: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +213,7 @@ enum PaletteKind {
     Commands,
     Projects,
     StatusDetails,
+    Layouts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +222,7 @@ enum PaletteCommand {
     OpenProjectViewer,
     OpenProjectShell,
     StatusDetails,
+    LayoutPicker,
     ResetWorkspace,
     SplitHorizontal,
     SplitVertical,
@@ -231,6 +274,11 @@ const COMMAND_ITEMS: &[CommandItem] = &[
         command: PaletteCommand::StatusDetails,
         label: "status details",
         detail: "show current sys/git/probes",
+    },
+    CommandItem {
+        command: PaletteCommand::LayoutPicker,
+        label: "layouts",
+        detail: "apply a named template layout",
     },
     CommandItem {
         command: PaletteCommand::ResetWorkspace,
@@ -300,6 +348,7 @@ impl RuntimeApp {
             projects: init.projects,
             selected_project: init.selected_project,
             default_viewer: init.default_viewer,
+            layouts: init.layouts,
             palette: None,
             show_help: true,
             compact_chrome: false,
@@ -310,6 +359,7 @@ impl RuntimeApp {
             last_notice: None,
             config_warning: init.config_warning,
             session_dirty: false,
+            session_persist: init.session_persist,
             status: StatusSnapshot::default(),
             status_target: init.status_target,
             nest_depth: init.nest_depth,
@@ -458,6 +508,78 @@ impl RuntimeApp {
             kind: PaletteKind::StatusDetails,
             selected: 0,
         });
+    }
+
+    fn open_layout_palette(&mut self) {
+        self.show_help = false;
+        if self.layouts.is_empty() {
+            self.last_error = Some("no layouts configured".to_string());
+            self.palette = None;
+            return;
+        }
+        self.palette = Some(Palette {
+            kind: PaletteKind::Layouts,
+            selected: 0,
+        });
+    }
+
+    /// Apply the layout at `index`: tear the workspace down to one shell, then
+    /// replay each step through the existing actions so PTY spawn/resize/autosave
+    /// come for free. A first-shell spawn failure during the reset leaves an empty
+    /// workspace — bail before replaying onto an empty tree. A mid-script spawn
+    /// failure leaves the partial layout (no rollback) with `last_error` set.
+    fn apply_layout(&mut self, index: usize) {
+        let Some(layout) = self.layouts.get(index).cloned() else {
+            self.last_error = Some(format!("layout index {index} is not available"));
+            return;
+        };
+        if let Err(e) = self.reset_workspace() {
+            // reset_workspace clears panes BEFORE its ?-propagating spawn loop, so a
+            // first-shell failure leaves the workspace empty. Do not replay steps.
+            self.last_error = Some(format!("layout '{}' reset failed: {e}", layout.name));
+            return;
+        }
+        for step in &layout.steps {
+            match *step {
+                LayoutStep::Split { dir, ratio } => {
+                    if !apply_action(self, Action::SplitFocusedPane { dir }) {
+                        // apply_action returns false only on a non-render action; the
+                        // split arm always returns true, so this is unreachable in
+                        // practice. Surface anything unexpected rather than spin.
+                        self.last_error =
+                            Some(format!("layout '{}' split step failed", layout.name));
+                        return;
+                    }
+                    if self.last_error.is_some() {
+                        // split_focused set last_error (e.g. PTY spawn failed):
+                        // leave the partial layout, stop replaying.
+                        return;
+                    }
+                    // Ratio rides the split: focus is still on the just-created leaf,
+                    // whose parent IS the split made above, so nudge_ratio can reach
+                    // it — the one moment it can. From 50 toward `target` for the
+                    // FIRST child (the original/left pane).
+                    if let Some(target) = ratio {
+                        apply_action(
+                            self,
+                            Action::ResizeFocusedPane {
+                                delta: split_ratio_delta(target),
+                            },
+                        );
+                    }
+                }
+                LayoutStep::Focus { dir } => {
+                    let action = match dir {
+                        crate::config::FocusDir::Next => Action::FocusNext,
+                        crate::config::FocusDir::Prev => Action::FocusPrev,
+                    };
+                    apply_action(self, action);
+                }
+            }
+        }
+        self.palette = None;
+        self.show_help = false;
+        self.last_notice = Some(format!("layout applied: {}", layout.name));
     }
 
     fn open_help(&mut self) {
@@ -759,6 +881,7 @@ impl RuntimeApp {
             PaletteKind::Commands => COMMAND_ITEMS.len(),
             PaletteKind::Projects => self.projects.len(),
             PaletteKind::StatusDetails => status::status_detail_rows(&self.status).len(),
+            PaletteKind::Layouts => self.layouts.len(),
         }
     }
 
@@ -780,6 +903,10 @@ impl RuntimeApp {
                 true
             }
             PaletteKind::StatusDetails => true,
+            PaletteKind::Layouts => {
+                self.apply_layout(palette.selected);
+                true
+            }
         }
     }
 
@@ -807,6 +934,10 @@ impl RuntimeApp {
             }
             PaletteCommand::StatusDetails => {
                 self.open_status_palette();
+                true
+            }
+            PaletteCommand::LayoutPicker => {
+                self.open_layout_palette();
                 true
             }
             PaletteCommand::ResetWorkspace => {
@@ -936,7 +1067,11 @@ fn run_loop(
             // save in run() would have written. session_dirty is set only on the
             // discrete mutations, so shell typing/PTY bytes never reach here.
             if app.session_dirty {
-                session_store::save(&app.session);
+                // Gate at the call site (not inside save_to_path): a no-persist boot
+                // must never reach save, which removes the file on an empty session.
+                if app.session_persist {
+                    session_store::save(&app.session);
+                }
                 app.session_dirty = false;
             }
         }
@@ -1355,6 +1490,7 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
         PaletteKind::StatusDetails => {
             (app.palette_len(PaletteKind::StatusDetails).min(14) + 2) as u16
         }
+        PaletteKind::Layouts => (app.layouts.len().min(12) + 2) as u16,
     };
     let rect = overlay_rect(workspace, 78, desired_height.max(5));
     if rect.width < 8 || rect.height < 3 {
@@ -1366,6 +1502,7 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
         PaletteKind::Commands => " command palette ",
         PaletteKind::Projects => " projects ",
         PaletteKind::StatusDetails => " status details ",
+        PaletteKind::Layouts => " layouts ",
     };
     let block = Block::default()
         .title(Line::from(Span::styled(title, Theme::label_focused())))
@@ -1473,6 +1610,12 @@ fn palette_lines(
                     &project.path.display().to_string(),
                     width,
                 )
+            }
+            PaletteKind::Layouts => {
+                let layout = &app.layouts[idx];
+                let steps = layout.steps.len();
+                let detail = format!("{steps} step{}", if steps == 1 { "" } else { "s" });
+                palette_line(idx == selected, layout.name.as_str(), &detail, width)
             }
             PaletteKind::StatusDetails => unreachable!("status palette handled above"),
         })
@@ -1824,26 +1967,92 @@ fn resolve_viewer_path(project: &Project, default_viewer: &Path) -> PathBuf {
     }
 }
 
+/// Resize delta that turns a freshly-created split (ratio 50, new leaf focused as
+/// the SECOND child) into one whose FIRST child occupies `target` percent. Shared
+/// by `apply_layout` and its test so the nudge direction cannot drift: `nudge_ratio`
+/// on the focused second child applies `ratio + (-delta)`, so `50 + (-delta) =
+/// target` ⇒ `delta = 50 - target`.
+fn split_ratio_delta(target: u16) -> i16 {
+    50i16 - target as i16
+}
+
+/// The boot session plus the flags that drive `run()`'s fallback and persistence.
+/// `restored` gates the rebuild-on-spawn-failure arm; `persist` gates BOTH save
+/// call sites so an Incompatible boot never overwrites the newer on-disk file.
+struct InitialSession {
+    session: Session,
+    selected: Option<usize>,
+    restored: bool,
+    persist: bool,
+    warning: Option<String>,
+}
+
 fn initial_session(
+    session_path: &Path,
     projects: &[Project],
     startup_project: Option<&str>,
     cwd: &Path,
-) -> (Session, Option<usize>, bool) {
-    if let Some(mut session) = session_store::load() {
-        let persisted_selected = selected_project_from_session(&session, projects);
-        let selected =
-            persisted_selected.or_else(|| select_start_project(projects, startup_project, cwd));
-        if persisted_selected != selected
-            && let Some(index) = selected
-            && let Some(project) = projects.get(index)
-        {
-            session.select_project(project_selection(project));
+) -> InitialSession {
+    match session_store::load_classified(session_path) {
+        Ok(session_store::SessionLoad::Loaded(mut session)) => {
+            let persisted_selected = selected_project_from_session(&session, projects);
+            let selected =
+                persisted_selected.or_else(|| select_start_project(projects, startup_project, cwd));
+            if persisted_selected != selected
+                && let Some(index) = selected
+                && let Some(project) = projects.get(index)
+            {
+                session.select_project(project_selection(project));
+            }
+            InitialSession {
+                session,
+                selected,
+                restored: true,
+                persist: true,
+                warning: None,
+            }
         }
-        return (session, selected, true);
+        Ok(session_store::SessionLoad::Incompatible) => {
+            // A newer Aetherspace wrote this file. Start fresh, but DO NOT persist:
+            // restored=false keeps a spawn failure off the rebuild arm (which would
+            // drop this banner), and persist=false stops the first autosave from
+            // clobbering — including the remove-on-empty path if the default session
+            // is then emptied.
+            let (session, selected) = fallback_session(projects, startup_project, cwd);
+            InitialSession {
+                session,
+                selected,
+                restored: false,
+                persist: false,
+                warning: Some(
+                    "session.toml written by a newer Aetherspace; not overwriting — \
+                     start fresh or upgrade"
+                        .to_string(),
+                ),
+            }
+        }
+        Ok(session_store::SessionLoad::None) => {
+            let (session, selected) = fallback_session(projects, startup_project, cwd);
+            InitialSession {
+                session,
+                selected,
+                restored: false,
+                persist: true,
+                warning: None,
+            }
+        }
+        Err(e) => {
+            crate::log::warn(&format!("session load skipped: {e}"));
+            let (session, selected) = fallback_session(projects, startup_project, cwd);
+            InitialSession {
+                session,
+                selected,
+                restored: false,
+                persist: true,
+                warning: None,
+            }
+        }
     }
-
-    let (session, selected) = fallback_session(projects, startup_project, cwd);
-    (session, selected, false)
 }
 
 fn fallback_session(
@@ -2131,5 +2340,120 @@ mod tests {
                 path: PathBuf::from("/work/fresh"),
             })
         );
+    }
+
+    #[test]
+    fn initial_session_on_incompatible_file_refuses_to_restore_or_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+        // A file from a newer binary (format_version beyond CURRENT).
+        std::fs::write(
+            &path,
+            "format_version = 999\nfocused = 0\nnext_pane_id = 1\n\n\
+             [[panes]]\nid = 0\ntitle = \"SHELL\"\n\n\
+             [panes.kind.Shell]\ncwd = \"/work/x\"\n\n\
+             [tiled]\nLeaf = 0\n\n[floating]\n",
+        )
+        .unwrap();
+
+        let projects = vec![Project {
+            name: "x".into(),
+            path: PathBuf::from("/work/x"),
+            viewer: None,
+        }];
+        let init = initial_session(&path, &projects, None, Path::new("/work/x"));
+        // Default session, NOT routed through the restore/rebuild arm, NOT persisted.
+        assert!(!init.restored, "Incompatible must not mark restored");
+        assert!(
+            !init.persist,
+            "Incompatible must not persist (refuse-to-clobber)"
+        );
+        let warning = init.warning.expect("Incompatible must carry a banner");
+        assert!(warning.contains("newer Aetherspace"), "{warning}");
+    }
+
+    /// Replay a layout's steps on a Session exactly as `apply_layout` does at the
+    /// session level (split_focused_shell per Split, resize_focused for the ratio,
+    /// focus_* per Focus). Lets the tree SHAPE be asserted without spawning PTYs;
+    /// the runtime wiring (apply_action → PTY spawn) is covered by the owner smoke.
+    fn replay_layout_shape(layout: &NamedLayout) -> Session {
+        let mut session = Session::single_shell(PathBuf::from("/work/x"));
+        for step in &layout.steps {
+            match *step {
+                LayoutStep::Split { dir, ratio } => {
+                    session
+                        .split_focused_shell(PathBuf::from("/work/x"), dir)
+                        .expect("split");
+                    if let Some(target) = ratio {
+                        assert!(session.resize_focused(split_ratio_delta(target)));
+                    }
+                }
+                LayoutStep::Focus { dir } => match dir {
+                    crate::config::FocusDir::Next => session.focus_next(),
+                    crate::config::FocusDir::Prev => session.focus_prev(),
+                },
+            }
+        }
+        session
+    }
+
+    #[test]
+    fn dev_layout_yields_big_left_split_right_tree() {
+        use crate::layout::TileNode;
+        let dev = NamedLayout {
+            name: "dev".into(),
+            steps: vec![
+                LayoutStep::Split {
+                    dir: SplitDir::Horizontal,
+                    ratio: Some(65),
+                },
+                LayoutStep::Split {
+                    dir: SplitDir::Vertical,
+                    ratio: None,
+                },
+            ],
+        };
+        let session = replay_layout_shape(&dev);
+        // Root: horizontal split, left 65%, right is a vertical split (top/bottom).
+        let tree = session.tiled().expect("tiled");
+        match tree {
+            TileNode::Split { dir, ratio, a, b } => {
+                assert_eq!(*dir, SplitDir::Horizontal, "root is the left/right split");
+                assert_eq!(*ratio, 65, "left pane occupies 65%");
+                assert!(
+                    matches!(a.as_ref(), TileNode::Leaf(_)),
+                    "left child is a single leaf"
+                );
+                match b.as_ref() {
+                    TileNode::Split { dir, a, b, .. } => {
+                        assert_eq!(*dir, SplitDir::Vertical, "right child is top/bottom");
+                        assert!(matches!(a.as_ref(), TileNode::Leaf(_)));
+                        assert!(matches!(b.as_ref(), TileNode::Leaf(_)));
+                    }
+                    other => panic!("right child must be a vertical split, got {other:?}"),
+                }
+            }
+            other => panic!("root must be a horizontal split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_horizontal_splits_yield_three_leaves() {
+        let triple = NamedLayout {
+            name: "triple".into(),
+            steps: vec![
+                LayoutStep::Split {
+                    dir: SplitDir::Horizontal,
+                    ratio: None,
+                },
+                LayoutStep::Split {
+                    dir: SplitDir::Horizontal,
+                    ratio: None,
+                },
+            ],
+        };
+        let session = replay_layout_shape(&triple);
+        let leaves = session.tiled().map(crate::layout::leaves).expect("tiled");
+        assert_eq!(leaves.len(), 3, "two splits on one shell yield three panes");
     }
 }

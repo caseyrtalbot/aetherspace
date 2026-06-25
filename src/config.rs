@@ -151,28 +151,44 @@ fn default_projects_root() -> PathBuf {
 }
 
 impl Config {
-    /// Load from `$XDG_CONFIG_HOME/aetherspace/config.toml` (else
-    /// `~/.config/...`). A missing file is the normal case and yields defaults;
-    /// a present-but-unparseable file logs a warning and also yields defaults, so
-    /// a typo never wedges startup.
-    pub fn load() -> Self {
+    /// Load from `$XDG_CONFIG_HOME/aetherspace/config.toml` (else `~/.config/...`),
+    /// also returning a one-line warning when a config file is present yet fails
+    /// to parse. A missing file is the normal case and yields defaults with `None`;
+    /// a present-but-unparseable file logs a warning and falls back to defaults so
+    /// a typo never wedges startup, returning a banner (including the path) the
+    /// runtime surfaces until dismissed.
+    pub fn load_with_warning() -> (Self, Option<String>) {
         let path = xdg::home("XDG_CONFIG_HOME", ".config").join("aetherspace/config.toml");
-        match fs::read_to_string(&path) {
-            Ok(text) => Self::from_toml_or_default(&text),
-            Err(_) => Self::default(),
+        let Ok(text) = fs::read_to_string(&path) else {
+            // Missing file is the normal case: defaults, no warning.
+            return (Self::default(), None);
+        };
+        // File present: a parse failure still falls back to defaults, but here we
+        // also surface a one-line banner that names the path the user must fix.
+        Self::from_toml_with_warning(&path, &text)
+    }
+
+    /// Parse `text` from `path`, returning defaults plus a one-line warning when
+    /// the file is present but unparseable. Split from the env-dependent file IO
+    /// in [`load_with_warning`] so the warning decision is unit-testable without
+    /// mutating process environment (which would race across test threads).
+    fn from_toml_with_warning(path: &Path, text: &str) -> (Self, Option<String>) {
+        match toml::from_str(text) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => {
+                crate::log::warn(&format!("config parse error, using defaults: {e}"));
+                let warning = format!("config {} parse error, using defaults", path.display());
+                (Self::default(), Some(warning))
+            }
         }
     }
 
     /// Parse TOML, falling back to defaults (with a logged warning) on any parse
-    /// error. Separated from the file IO in `load` so the fallback is unit-tested.
+    /// error. The unit-tested fallback seam; production loads go through
+    /// [`from_toml_with_warning`], so this is only referenced by tests.
+    #[cfg(test)]
     fn from_toml_or_default(text: &str) -> Self {
-        match toml::from_str(text) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                crate::log::warn(&format!("config parse error, using defaults: {e}"));
-                Self::default()
-            }
-        }
+        Self::from_toml_with_warning(Path::new(""), text).0
     }
 
     /// The nav project list: the pinned `projects` verbatim if configured, else
@@ -317,6 +333,32 @@ mod tests {
     fn garbage_config_falls_back_to_defaults() {
         let cfg = Config::from_toml_or_default("this is not = = valid toml [[[");
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn present_unparseable_config_yields_warning_with_path() {
+        let path = Path::new("/cfg/aetherspace/config.toml");
+        let (cfg, warning) = Config::from_toml_with_warning(path, "not = = valid [[[");
+        // Still falls back to defaults so a typo never wedges startup.
+        assert_eq!(cfg, Config::default());
+        // One-line banner that names the offending path.
+        let warning = warning.expect("unparseable present file must warn");
+        assert!(
+            warning.contains("/cfg/aetherspace/config.toml"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains('\n'),
+            "warning must be one line: {warning}"
+        );
+    }
+
+    #[test]
+    fn valid_config_yields_no_warning() {
+        let (cfg, warning) =
+            Config::from_toml_with_warning(Path::new("/cfg/config.toml"), "projects_root = \"/x\"");
+        assert_eq!(cfg.projects_root, PathBuf::from("/x"));
+        assert_eq!(warning, None);
     }
 
     #[test]

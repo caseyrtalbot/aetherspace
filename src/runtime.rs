@@ -39,7 +39,7 @@ const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 const MAX_EVENTS_PER_TURN: usize = 256;
 
-pub(crate) fn run(config: Config) -> Result<()> {
+pub(crate) fn run(config: Config, config_warning: Option<String>) -> Result<()> {
     let (tx, rx) = mpsc::channel::<RuntimeEvent>();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let projects = config.resolve_projects();
@@ -57,6 +57,7 @@ pub(crate) fn run(config: Config) -> Result<()> {
         selected_project,
         default_viewer: config.workflow.default_viewer.clone(),
         status_target: status_target.clone(),
+        config_warning: config_warning.clone(),
     }) {
         Ok(app) => app,
         Err(e) if restored_session => {
@@ -73,6 +74,7 @@ pub(crate) fn run(config: Config) -> Result<()> {
                 selected_project,
                 default_viewer: config.workflow.default_viewer,
                 status_target: status_target.clone(),
+                config_warning,
             })?
         }
         Err(e) => return Err(e),
@@ -112,6 +114,10 @@ struct RuntimeApp {
     notify: Sender<RuntimeEvent>,
     last_error: Option<String>,
     last_notice: Option<String>,
+    /// Shared error sink for config/reload/keybind failures, surfaced as an Error
+    /// banner until the first keypress dismisses it. No timer exists, so it is
+    /// keypress-cleared only (see `handle_key`).
+    config_warning: Option<String>,
     status: StatusSnapshot,
     status_target: StatusTarget,
 }
@@ -125,6 +131,7 @@ struct RuntimeAppInit {
     selected_project: Option<usize>,
     default_viewer: PathBuf,
     status_target: StatusTarget,
+    config_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +281,7 @@ impl RuntimeApp {
             notify: init.notify,
             last_error: None,
             last_notice: None,
+            config_warning: init.config_warning,
             status: StatusSnapshot::default(),
             status_target: init.status_target,
         })
@@ -872,6 +880,16 @@ fn handle(app: &mut RuntimeApp, event: RuntimeEvent) -> bool {
 }
 
 fn handle_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
+    // First real keypress dismisses the config-warning banner. No timer exists,
+    // so this is the only way it clears; force a redraw so it actually vanishes
+    // (the blocked loop redraws only when the triggering key is dirty).
+    let cleared_warning = key.kind != KeyEventKind::Release && app.config_warning.take().is_some();
+    // OR the dismissal in so the banner vanishes even when the key was otherwise
+    // a no-op for rendering.
+    dispatch_key(app, key) || cleared_warning
+}
+
+fn dispatch_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     if app.show_help {
         return handle_help_key(app, key);
     }
@@ -1380,7 +1398,12 @@ fn draw_statusline(frame: &mut Frame, app: &RuntimeApp, area: Rect) {
 }
 
 fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
-    if let Some(error) = &app.last_error {
+    if let Some(warning) = &app.config_warning {
+        // Highest priority and shown even over the startup help, since a present
+        // config that failed to parse is a state the user should fix. Cleared on
+        // the first keypress (see `handle_key`).
+        (warning.as_str(), StatusTone::Error)
+    } else if let Some(error) = &app.last_error {
         (error.as_str(), StatusTone::Error)
     } else if let Some(notice) = &app.last_notice {
         (notice.as_str(), StatusTone::Notice)

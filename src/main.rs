@@ -27,5 +27,6 @@ fn main() -> Result<()> {
     log::init();
     log::info("aetherspace starting");
 
-    runtime::run(config::Config::load())
+    let (config, config_warning) = config::Config::load_with_warning();
+    runtime::run(config, config_warning)
 }

@@ -250,19 +250,17 @@ Leaf = 0
 
     #[test]
     fn newer_format_with_unparseable_body_classifies_incompatible() {
-        // The dangerous B2 case: a newer file whose body holds a TileNode variant
-        // this (pre-B2) build cannot deserialize. `toml::from_str::<Session>` fails
-        // BEFORE the version check, so without the version probe this would route to
-        // the Err arm (treated as corrupt, persist=true) and be clobbered. The probe
-        // must classify it Incompatible so the refuse-to-clobber gate protects it.
+        // The dangerous forward case: a newer file whose body holds a TileNode variant
+        // this build cannot deserialize. `toml::from_str::<Session>` fails BEFORE the
+        // version check, so without the version probe this would route to the Err arm
+        // (treated as corrupt, persist=true) and be clobbered. The probe must classify
+        // it Incompatible so the refuse-to-clobber gate protects it. `Stack` is real
+        // post-B2, so this uses a still-future `Grid` variant at format_version 3.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.toml");
         let future = LEGACY_SESSION_NO_FORMAT_VERSION
-            .replacen("focused = 0", "format_version = 2\nfocused = 0", 1)
-            .replace(
-                "[tiled]\nLeaf = 0",
-                "[tiled.Stack]\nactive = 0\nchildren = []",
-            );
+            .replacen("focused = 0", "format_version = 3\nfocused = 0", 1)
+            .replace("[tiled]\nLeaf = 0", "[tiled.Grid]\nrows = 2\ncols = 2");
         fs::write(&path, &future).unwrap();
 
         // Sanity: the body really IS unparseable as the current Session shape, so
@@ -307,5 +305,61 @@ Leaf = 0
             before, after,
             "Incompatible file must survive byte-for-byte"
         );
+    }
+
+    #[test]
+    fn stack_session_round_trips_at_v2_and_is_incompatible_to_a_v1_guard() {
+        // A session holding a TileNode::Stack must round-trip on this v2 binary, and
+        // the SAME on-disk file must look Incompatible to a pre-B2 (CURRENT = 1) guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+
+        let mut session = Session::single_shell(PathBuf::from("/work/aetherspace"));
+        session
+            .split_focused_shell(PathBuf::from("/work/aetherspace"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_stack_focused(), "expected a stack to form");
+        assert_eq!(session.format_version(), 2);
+
+        save_to_path(&session, &path).unwrap();
+
+        // v2 binary: this file round-trips identically and classifies Loaded.
+        let reloaded = loaded_session(&path).expect("v2 binary loads its own Stack file");
+        assert_eq!(reloaded, session);
+
+        // The file carries the v2 marker and a [tiled.Stack] body.
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("format_version = 2"));
+        assert!(text.contains("[tiled.Stack]"));
+
+        // A pre-B2 guard's threshold is CURRENT = 1: the same VersionProbe the load
+        // path uses reads format_version = 2 > 1 ⇒ Incompatible (refuse-to-clobber).
+        #[derive(serde::Deserialize)]
+        struct VersionProbe {
+            #[serde(default)]
+            format_version: u32,
+        }
+        const PRE_B2_CURRENT: u32 = 1;
+        let probe: VersionProbe = toml::from_str(&text).unwrap();
+        assert!(
+            probe.format_version > PRE_B2_CURRENT,
+            "a v1 binary must classify this Incompatible, not load or clobber it"
+        );
+    }
+
+    #[test]
+    fn version_one_file_still_loads_on_the_v2_binary() {
+        // Additive forward-read: a legacy version-1 file (no Stack) deserializes on
+        // the v2 binary and is accepted (accept-and-rewrite up to CURRENT).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.toml");
+        fs::write(&path, LEGACY_SESSION_NO_FORMAT_VERSION).unwrap();
+
+        let session = match load_classified(&path).unwrap() {
+            SessionLoad::Loaded(session) => session,
+            other => panic!("expected Loaded, got {other:?}"),
+        };
+        assert_eq!(session.format_version(), 1);
+        assert_eq!(session.pane_specs().len(), 1);
     }
 }

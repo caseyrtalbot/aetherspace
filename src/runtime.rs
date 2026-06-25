@@ -228,6 +228,7 @@ enum PaletteCommand {
     SplitVertical,
     ToggleFloat,
     ToggleZoom,
+    ToggleStack,
     ToggleCompact,
     Restart,
     Close,
@@ -304,6 +305,11 @@ const COMMAND_ITEMS: &[CommandItem] = &[
         command: PaletteCommand::ToggleZoom,
         label: "zoom",
         detail: "toggle focused tiled pane",
+    },
+    CommandItem {
+        command: PaletteCommand::ToggleStack,
+        label: "stack/unstack",
+        detail: "collapse split group into a stack",
     },
     CommandItem {
         command: PaletteCommand::ToggleCompact,
@@ -708,6 +714,15 @@ impl RuntimeApp {
         }
     }
 
+    fn toggle_stack(&mut self) {
+        if self.session.toggle_stack_focused() {
+            self.resize_to_area(self.last_area);
+            self.last_notice = Some("stack toggled".to_string());
+        } else {
+            self.last_notice = Some("stack: focus a tiled split first".to_string());
+        }
+    }
+
     fn process_pty(&mut self, id: PaneProcessId) {
         if let Some(pane) = self.panes.get_mut(&id.pane)
             && pane.process_pending(id)
@@ -809,6 +824,16 @@ impl RuntimeApp {
                 if rect_contains(rect, column, row) {
                     return Some(*id);
                 }
+            }
+            // A click on a collapsed-member chip focuses+expands that member. Tested
+            // before tiled bodies because a chip sits in the strip that the active
+            // member's body rect already excludes. Hidden while zoomed (single pane).
+            if let Some(tree) = self.session.tiled()
+                && let Some(chip) = layout::stack_chips(tree, workspace)
+                    .into_iter()
+                    .find(|chip| rect_contains(chip.rect, column, row))
+            {
+                return Some(chip.id);
             }
         }
         tiled_panes(&self.session, workspace)
@@ -960,6 +985,7 @@ impl RuntimeApp {
             ),
             PaletteCommand::ToggleFloat => apply_action(self, Action::ToggleFloatFocusedPane),
             PaletteCommand::ToggleZoom => apply_action(self, Action::ToggleZoomFocusedPane),
+            PaletteCommand::ToggleStack => apply_action(self, Action::ToggleStack),
             PaletteCommand::ToggleCompact => apply_action(self, Action::ToggleCompactChrome),
             PaletteCommand::Restart => apply_action(self, Action::RestartFocusedPane),
             PaletteCommand::Close => apply_action(self, Action::CloseFocusedPane),
@@ -1338,6 +1364,11 @@ fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
             app.session_dirty = true;
             true
         }
+        Action::ToggleStack => {
+            app.toggle_stack();
+            app.session_dirty = true;
+            true
+        }
         Action::ToggleCompactChrome => {
             app.compact_chrome = !app.compact_chrome;
             app.resize_to_area(app.last_area);
@@ -1410,6 +1441,18 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
 
     for pane in tiled {
         draw_pane(frame, app, pane.id, pane.rect, false);
+    }
+
+    // Stack chip strips ride the tiled-pane pass (NOT a global overlay) so floats and
+    // zoom paint over them correctly. Hidden while zoomed: a single pane fills the
+    // workspace and has no strip.
+    if app.session.zoomed().is_none()
+        && !app.compact_chrome
+        && let Some(tree) = app.session.tiled()
+    {
+        for chip in layout::stack_chips(tree, workspace) {
+            draw_stack_chip(frame, app, chip);
+        }
     }
 
     if app.session.zoomed().is_none() {
@@ -1849,6 +1892,40 @@ fn overlay_rect(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
         width,
         height,
     )
+}
+
+/// Paint one collapsed-stack chip into the indicator strip: the active member in the
+/// accent label style, collapsed members dim. The chip carries the member's title so
+/// the strip reads as tabs.
+fn draw_stack_chip(frame: &mut Frame, app: &RuntimeApp, chip: layout::StackChip) {
+    if chip.rect.width == 0 || chip.rect.height == 0 {
+        return;
+    }
+    let style = if chip.active {
+        Theme::label_focused()
+    } else {
+        Theme::label()
+    };
+    let title = app
+        .session
+        .spec(chip.id)
+        .map(|spec| {
+            app.panes
+                .get(&chip.id)
+                .map(|pane| pane.title(spec))
+                .unwrap_or_else(|| spec.title.clone())
+        })
+        .unwrap_or_else(|| format!("pane {}", chip.id.0));
+    let marker = if chip.active { "▣ " } else { "▢ " };
+    let label = truncate_width(
+        &format!("{marker}{title}"),
+        chip.rect.width.saturating_sub(1),
+    );
+    frame.render_widget(Clear, chip.rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!(" {label}"), style))),
+        chip.rect,
+    );
 }
 
 fn draw_separator(frame: &mut Frame, sep: layout::SepLine) {

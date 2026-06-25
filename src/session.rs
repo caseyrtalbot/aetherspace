@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::layout::{
     CloseOutcome, FloatGeom, SplitDir, TileNode, close_leaf, contains_leaf, dock_leaf, leaves,
-    nudge_ratio, split_leaf,
+    nudge_ratio, set_active_for_leaf, split_leaf, toggle_stack,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub(crate) struct PaneId(pub(crate) u64);
 /// Bumped when the serialized shape changes in a way an older binary cannot
 /// faithfully read (B2 raises this to 2 for `TileNode::Stack`). The load guard in
 /// `session_store` refuses to overwrite a file whose `format_version` exceeds this.
-pub(crate) const CURRENT_SESSION_FORMAT: u32 = 1;
+pub(crate) const CURRENT_SESSION_FORMAT: u32 = 2;
 
 /// `#[serde(default)]` target for `format_version`. Returns 1 (NOT 0) on purpose:
 /// every `session.toml` written before the guard lacks the key and is a legitimate
@@ -160,7 +160,16 @@ impl Session {
         }
         self.focused = Some(id);
         self.zoomed = None;
+        self.sync_stack_active(id);
         true
+    }
+
+    /// Expand the focused member of any enclosing stack so focus and the visible
+    /// pane stay consistent. A no-op when the focused leaf is not inside a stack.
+    fn sync_stack_active(&mut self, id: PaneId) {
+        if let Some(tree) = self.tiled.as_mut() {
+            set_active_for_leaf(tree, id);
+        }
     }
 
     pub(crate) fn resize_focused(&mut self, delta: i16) -> bool {
@@ -180,11 +189,34 @@ impl Session {
         if !self.is_tiled(id) {
             return false;
         }
+        // Expand the focused member in any enclosing stack first, so un-zooming
+        // returns to a strip that shows the pane that was zoomed.
+        self.sync_stack_active(id);
         self.zoomed = if self.zoomed == Some(id) {
             None
         } else {
             Some(id)
         };
+        true
+    }
+
+    /// Collapse the focused leaf's split group into a `Stack` (or expand it back).
+    /// Clears zoom so the stack renders its full strip. A no-op for a floating or
+    /// lone pane (nothing to fold). Returns true if the layout changed.
+    pub(crate) fn toggle_stack_focused(&mut self) -> bool {
+        let Some(id) = self.focused else {
+            return false;
+        };
+        if !self.is_tiled(id) {
+            return false;
+        }
+        let Some(tree) = self.tiled.as_mut() else {
+            return false;
+        };
+        if !toggle_stack(tree, id) {
+            return false;
+        }
+        self.zoomed = None;
         true
     }
 
@@ -233,6 +265,13 @@ impl Session {
         }
         if self.focused == Some(id) {
             self.focused = preferred_focus.or_else(|| self.focus_order().first().copied());
+            // Closing the active member of a 3+-member stack leaves the surviving
+            // stack's `active` pointing at a different node than the new `focused`
+            // (close_in re-clamps but cannot know where focus lands). Re-assert the
+            // "active follows focused" invariant so input and the visible PTY agree.
+            if let Some(focused) = self.focused {
+                self.sync_stack_active(focused);
+            }
         }
         !self.panes.is_empty()
     }
@@ -277,8 +316,10 @@ impl Session {
             .and_then(|id| order.iter().position(|pane| *pane == id))
             .unwrap_or(0);
         let next = (current as isize + delta).rem_euclid(order.len() as isize) as usize;
-        self.focused = Some(order[next]);
+        let id = order[next];
+        self.focused = Some(id);
         self.zoomed = None;
+        self.sync_stack_active(id);
     }
 
     fn focus_order(&self) -> Vec<PaneId> {
@@ -507,6 +548,137 @@ mod tests {
         assert_eq!(session.zoomed(), None);
     }
 
+    fn three_pane_session() -> Session {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split 1");
+        session
+            .split_focused_shell(PathBuf::from("/work/three"), SplitDir::Horizontal)
+            .expect("split 2");
+        session
+    }
+
+    fn is_stack(node: &TileNode) -> bool {
+        matches!(node, TileNode::Stack { .. })
+    }
+
+    /// Whether a `Stack` appears anywhere in the tree. After the immediate-parent
+    /// fold, a 3-pane tree nests the stack under the root split rather than at root.
+    fn tree_has_stack(node: &TileNode) -> bool {
+        match node {
+            TileNode::Leaf(_) => false,
+            TileNode::Stack { .. } => true,
+            TileNode::Split { a, b, .. } => tree_has_stack(a) || tree_has_stack(b),
+        }
+    }
+
+    #[test]
+    fn toggle_stack_collapses_siblings_and_unfolds_preserving_focus() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_zoom_focused());
+        assert_eq!(session.zoomed(), Some(PaneId(1)));
+
+        // Fold into a stack: focus preserved, zoom cleared, tree is a Stack.
+        assert!(session.toggle_stack_focused());
+        assert_eq!(session.focused(), Some(PaneId(1)));
+        assert_eq!(session.zoomed(), None);
+        assert!(is_stack(session.tiled().unwrap()));
+
+        // Unfold back to a Split, focus still on the same pane.
+        assert!(session.toggle_stack_focused());
+        assert_eq!(session.focused(), Some(PaneId(1)));
+        assert!(matches!(session.tiled().unwrap(), TileNode::Split { .. }));
+    }
+
+    #[test]
+    fn zoom_on_a_stacked_pane_keeps_the_stack_intact() {
+        let mut session = three_pane_session();
+        assert!(session.toggle_stack_focused());
+        // Immediate-parent fold nests the stack under the root split (panes 1+2).
+        assert!(tree_has_stack(session.tiled().unwrap()));
+        let active_before = session.focused();
+
+        // Zoom the active member, then un-zoom: the stack survives with same active.
+        assert!(session.toggle_zoom_focused());
+        assert_eq!(session.zoomed(), session.focused());
+        assert!(session.toggle_zoom_focused());
+        assert_eq!(session.zoomed(), None);
+        assert!(tree_has_stack(session.tiled().unwrap()));
+        assert_eq!(session.focused(), active_before);
+    }
+
+    #[test]
+    fn float_on_a_stacked_pane_docks_adjacent_as_a_split() {
+        let mut session = three_pane_session();
+        assert!(session.toggle_stack_focused());
+        let floated = session.focused().expect("focused");
+
+        // Float the active member OUT: it leaves the stack Vec.
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 4,
+            y: 3,
+            width: 20,
+            height: 10,
+        }));
+        assert!(session.is_floating(floated));
+        // Two members remain in the stack.
+        assert_eq!(session.tiled().map(leaves).map(|l| l.len()), Some(2));
+
+        // Dock it back: lands ADJACENT as a Split (documented, not auto-restacked).
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }));
+        assert!(!session.is_floating(floated));
+        assert!(matches!(session.tiled().unwrap(), TileNode::Split { .. }));
+        let mut all = session.tiled().map(leaves).unwrap();
+        all.sort();
+        assert_eq!(all, vec![PaneId(0), PaneId(1), PaneId(2)]);
+    }
+
+    #[test]
+    fn floating_out_of_a_two_member_stack_collapses_it() {
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_stack_focused());
+        assert!(is_stack(session.tiled().unwrap()));
+
+        // Float one member out: the surviving one-member stack collapses to a Leaf.
+        assert!(session.toggle_float_focused(FloatGeom {
+            x: 4,
+            y: 3,
+            width: 20,
+            height: 10,
+        }));
+        assert!(matches!(session.tiled().unwrap(), TileNode::Leaf(_)));
+    }
+
+    #[test]
+    fn focusing_a_stacked_member_expands_it() {
+        // Two-pane fold puts the stack at the root so the active index is easy to read.
+        let mut session = Session::single_shell(PathBuf::from("/work/one"));
+        session
+            .split_focused_shell(PathBuf::from("/work/two"), SplitDir::Horizontal)
+            .expect("split");
+        assert!(session.toggle_stack_focused());
+        // Focus the OTHER member by id; the stack's active must follow.
+        assert!(session.focus_pane(PaneId(0)));
+        match session.tiled().unwrap() {
+            TileNode::Stack { active, children } => {
+                assert!(matches!(children[*active], TileNode::Leaf(PaneId(0))));
+            }
+            other => panic!("expected stack, got {other:?}"),
+        }
+    }
+
     #[test]
     fn focus_pane_selects_existing_pane_and_clears_zoom() {
         let mut session = Session::single_shell(PathBuf::from("/work/one"));
@@ -520,5 +692,37 @@ mod tests {
         assert_eq!(session.zoomed(), None);
         assert!(!session.focus_pane(PaneId(99)));
         assert_eq!(session.focused(), Some(PaneId(0)));
+    }
+
+    #[test]
+    fn closing_the_active_member_of_a_three_member_stack_keeps_active_following_focused() {
+        // Build a true 3-member root stack (the immediate-parent fold only stacks 2,
+        // so construct the tree directly), active+focused on the middle member.
+        let mut session = three_pane_session();
+        session.tiled = Some(TileNode::Stack {
+            children: vec![
+                TileNode::Leaf(PaneId(0)),
+                TileNode::Leaf(PaneId(1)),
+                TileNode::Leaf(PaneId(2)),
+            ],
+            active: 1,
+        });
+        session.focused = Some(PaneId(1));
+
+        // Close the focused/active member. The surviving 2-member stack must keep its
+        // `active` pointing at the SAME node as the new `focused`, or input routes to
+        // an invisible pane while a different one is displayed (the A1 state/render split).
+        assert!(session.close_pane(PaneId(1)));
+        let focused = session.focused().expect("focus moved to a survivor");
+        match session.tiled().unwrap() {
+            TileNode::Stack { children, active } => {
+                assert_eq!(
+                    children[*active],
+                    TileNode::Leaf(focused),
+                    "the expanded stack member matches session.focused()"
+                );
+            }
+            other => panic!("expected surviving Stack, got {other:?}"),
+        }
     }
 }

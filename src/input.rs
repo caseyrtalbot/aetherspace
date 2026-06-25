@@ -1,12 +1,14 @@
 //! Input policy: leader handling and shell-safe key encoding.
 
+use std::sync::Arc;
+
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::action::Action;
-use crate::layout::SplitDir;
+use crate::keymap::{self, Keymap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InputConfig {
@@ -126,13 +128,9 @@ fn parse_modified_char(normalized: &str) -> Option<Leader> {
         return None;
     };
 
-    let code = match rest {
-        "space" => KeyCode::Char(' '),
-        "tab" => KeyCode::Tab,
-        "backspace" => KeyCode::Backspace,
-        _ if rest.chars().count() == 1 => KeyCode::Char(rest.chars().next()?),
-        _ => return None,
-    };
+    // Shared remainder vocabulary with the keymap parser (keymap::parse_key_name)
+    // so leader and keymap agree on names; leader keeps requiring a modifier prefix.
+    let code = keymap::parse_key_name(rest)?;
     Some(Leader::Key(KeyBinding::new(code, modifiers)))
 }
 
@@ -140,6 +138,9 @@ fn parse_modified_char(normalized: &str) -> Option<Leader> {
 pub(crate) struct InputRouter {
     config: InputConfig,
     mode: InputMode,
+    /// Resolved leader table, shared with the runtime so both dispatch surfaces
+    /// read one source of truth (built once from config at init).
+    keymap: Arc<Keymap>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +150,19 @@ enum InputMode {
 }
 
 impl InputRouter {
+    /// Build a router with the default keymap. Used by tests; the runtime threads a
+    /// shared keymap via [`InputRouter::with_keymap`].
+    #[cfg(test)]
     pub(crate) fn new(config: InputConfig) -> Self {
+        Self::with_keymap(config, Arc::new(Keymap::default()))
+    }
+
+    /// Build a router sharing a resolved keymap with the runtime.
+    pub(crate) fn with_keymap(config: InputConfig, keymap: Arc<Keymap>) -> Self {
         Self {
             config,
             mode: InputMode::ShellCapture,
+            keymap,
         }
     }
 
@@ -203,38 +213,13 @@ impl InputRouter {
     }
 
     fn route_after_leader(&mut self, key: KeyEvent) -> Action {
+        if let Some(action) = self.keymap.lookup_leader(key) {
+            return action.to_action();
+        }
+        // Fallbacks PRESERVED verbatim (not keymap entries): Esc cancels leader
+        // mode, the leader pressed again sends its literal bytes, and any other key
+        // is a no-op that just re-renders.
         match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
-            KeyCode::Char('r') | KeyCode::Char('R') => Action::RestartFocusedPane,
-            KeyCode::Char('x') | KeyCode::Char('X') => Action::CloseFocusedPane,
-            KeyCode::Char('|') => Action::SplitFocusedPane {
-                dir: SplitDir::Horizontal,
-            },
-            KeyCode::Char('-') => Action::SplitFocusedPane {
-                dir: SplitDir::Vertical,
-            },
-            KeyCode::Tab
-            | KeyCode::Right
-            | KeyCode::Down
-            | KeyCode::Char('n')
-            | KeyCode::Char('N') => Action::FocusNext,
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Action::FocusPrev,
-            KeyCode::Char('>') | KeyCode::Char('=') | KeyCode::Char('+') => {
-                Action::ResizeFocusedPane { delta: 5 }
-            }
-            KeyCode::Char('<') | KeyCode::Char('_') => Action::ResizeFocusedPane { delta: -5 },
-            KeyCode::Char('z') | KeyCode::Char('Z') => Action::ToggleZoomFocusedPane,
-            KeyCode::Char('f') | KeyCode::Char('F') => Action::ToggleFloatFocusedPane,
-            KeyCode::Char('t') | KeyCode::Char('T') => Action::ToggleStack,
-            KeyCode::Char('b') | KeyCode::Char('B') => Action::ToggleCompactChrome,
-            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Action::OpenHelp,
-            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char(':') => {
-                Action::OpenCommandPalette
-            }
-            KeyCode::Char('p') | KeyCode::Char('P') => Action::OpenProjectPalette,
-            KeyCode::Char('v') | KeyCode::Char('V') => Action::OpenProjectViewer,
-            KeyCode::Char('s') | KeyCode::Char('S') => Action::OpenProjectShell,
-            KeyCode::Char('e') | KeyCode::Char('E') => Action::EditScrollback,
             KeyCode::Esc => Action::Render,
             _ if self.config.leader.matches(key) => Action::SendBytes(self.config.leader.bytes()),
             _ => Action::Render,
@@ -504,6 +489,7 @@ fn encode_control_char(c: char) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::SplitDir;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

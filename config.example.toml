@@ -48,6 +48,29 @@ scrollback = 10000  # lines of PTY scrollback retained
 [input]
 leader = "ctrl-space"  # accepts ctrl-space, ctrl-@, ctrl-g, alt-g, esc
 
+# Keymap overrides (sparse). Two tables mirror the two dispatch surfaces:
+#   [keymap.global]  always-on shortcuts, matched on the EXACT chord (with
+#                    modifiers): keys like "f2", "ctrl-enter", "ctrl-tab".
+#   [keymap.leader]  keys pressed AFTER the leader, matched on the key only
+#                    (modifiers ignored): a single char like "q" or a name.
+# Each entry is  chord = "action". Only the chords you list change; everything
+# else keeps its built-in default. An unknown key or action drops just that one
+# entry with a one-line warning (a typo never wedges the rest of the keymap).
+#
+# Key spellings: single chars ("q"), "space", "tab", "backtab", "enter", "esc",
+#   "left"/"right"/"up"/"down", "f1".."f12". Global chords may prefix modifiers:
+#   "ctrl-"/"alt-"/"shift-" (e.g. "ctrl-enter", "alt-tab").
+# Action names (snake_case): quit, split_horizontal, split_vertical, restart,
+#   close, focus_next, focus_prev, resize_grow, resize_shrink, zoom, float,
+#   toggle_stack, toggle_compact, help, command_palette, project_palette,
+#   viewer, shell, edit_scrollback.
+#
+# [keymap.leader]
+# x = "quit"           # press leader then x to quit
+#
+# [keymap.global]
+# f12 = "command_palette"
+
 # Workflow defaults.
 [workflow]
 startup_project = "aetherspace"  # optional; exact project name from the nav list

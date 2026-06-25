@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -26,6 +27,7 @@ use crate::action::Action;
 use crate::config::{Config, LayoutStep, NamedLayout, Project};
 use crate::event::{PaneProcessId, RuntimeEvent};
 use crate::input::{InputConfig, InputRouter, encode_mouse};
+use crate::keymap::{BindAction, Chord, Keymap, chord_label};
 use crate::layout::{self, FloatGeom, SolvedPane, SplitDir};
 use crate::pane::{PaneRuntime, ensure_spec_matches_runtime};
 use crate::session::{PaneId, PaneSpec, ProjectSelection, Session};
@@ -72,9 +74,16 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
     let config_warning = merge_warnings(config_warning, session_warning);
     let status_target = StatusTarget::new(selected_project_path(&projects, selected_project));
     let scrollback = config.shell.scrollback;
+    // One resolved keymap, shared (cloned Arc) between the input router and the
+    // runtime so both dispatch surfaces and the help/status renderers agree.
+    let keymap = Arc::new(config.resolved_keymap.clone());
     let mut app = match RuntimeApp::new(RuntimeAppInit {
         session,
-        input: InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
+        input: InputRouter::with_keymap(
+            InputConfig::from_leader_name(&config.input.leader),
+            keymap.clone(),
+        ),
+        keymap: keymap.clone(),
         scrollback,
         notify: tx.clone(),
         projects: projects.clone(),
@@ -94,7 +103,11 @@ pub(crate) fn run(config: Config, config_warning: Option<String>, nest_depth: u3
             status_target.set(selected_project_path(&projects, selected_project));
             RuntimeApp::new(RuntimeAppInit {
                 session,
-                input: InputRouter::new(InputConfig::from_leader_name(&config.input.leader)),
+                input: InputRouter::with_keymap(
+                    InputConfig::from_leader_name(&config.input.leader),
+                    keymap.clone(),
+                ),
+                keymap,
                 scrollback,
                 notify: tx.clone(),
                 projects,
@@ -148,6 +161,10 @@ struct RuntimeApp {
     session: Session,
     panes: BTreeMap<PaneId, PaneRuntime>,
     input: InputRouter,
+    /// Resolved keymap shared with the [`InputRouter`] (one `Arc<Keymap>` cloned
+    /// into both at init). Drives `global_shortcut`, the help overlay, and the
+    /// statusline hints so all three read one source of truth.
+    keymap: Arc<Keymap>,
     projects: Vec<Project>,
     selected_project: Option<usize>,
     default_viewer: PathBuf,
@@ -188,6 +205,7 @@ struct RuntimeApp {
 struct RuntimeAppInit {
     session: Session,
     input: InputRouter,
+    keymap: Arc<Keymap>,
     scrollback: usize,
     notify: Sender<RuntimeEvent>,
     projects: Vec<Project>,
@@ -240,12 +258,6 @@ enum StatusTone {
     Normal,
     Notice,
     Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GlobalShortcut {
-    Help,
-    Action(Action),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,6 +363,7 @@ impl RuntimeApp {
             session: init.session,
             panes,
             input: init.input,
+            keymap: init.keymap,
             projects: init.projects,
             selected_project: init.selected_project,
             default_viewer: init.default_viewer,
@@ -1210,14 +1223,9 @@ fn dispatch_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     if app.show_help {
         return handle_help_key(app, key);
     }
-    if let Some(shortcut) = global_shortcut(app.focused_is_viewer(), key) {
-        return match shortcut {
-            GlobalShortcut::Help => {
-                app.open_help();
-                true
-            }
-            GlobalShortcut::Action(action) => apply_action(app, action),
-        };
+    if let Some(action) = global_shortcut(&app.keymap, app.focused_is_viewer(), key) {
+        // Help collapses into Action::OpenHelp; apply_action opens the overlay.
+        return apply_action(app, action);
     }
     if let Some(dirty) = app.handle_palette_key(key) {
         return dirty;
@@ -1242,59 +1250,13 @@ fn handle_help_key(app: &mut RuntimeApp, key: KeyEvent) -> bool {
     }
 }
 
-fn global_shortcut(focused_is_viewer: bool, key: KeyEvent) -> Option<GlobalShortcut> {
+fn global_shortcut(keymap: &Keymap, focused_is_viewer: bool, key: KeyEvent) -> Option<Action> {
     if key.kind == KeyEventKind::Release {
         return None;
     }
-
-    if key.modifiers == KeyModifiers::NONE {
-        return match key.code {
-            KeyCode::F(1) => Some(GlobalShortcut::Help),
-            KeyCode::F(2) => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
-            KeyCode::F(3) => Some(GlobalShortcut::Action(Action::OpenProjectPalette)),
-            KeyCode::F(4) => Some(GlobalShortcut::Action(Action::OpenProjectViewer)),
-            KeyCode::F(5) => Some(GlobalShortcut::Action(Action::OpenProjectShell)),
-            KeyCode::F(6) => Some(GlobalShortcut::Action(Action::FocusNext)),
-            KeyCode::F(7) => Some(GlobalShortcut::Action(Action::FocusPrev)),
-            KeyCode::F(8) => Some(GlobalShortcut::Action(Action::ToggleZoomFocusedPane)),
-            KeyCode::F(9) => Some(GlobalShortcut::Action(Action::CloseFocusedPane)),
-            KeyCode::F(10) => Some(GlobalShortcut::Action(Action::Quit)),
-            KeyCode::Tab if focused_is_viewer => Some(GlobalShortcut::Action(Action::FocusNext)),
-            KeyCode::BackTab if focused_is_viewer => {
-                Some(GlobalShortcut::Action(Action::FocusPrev))
-            }
-            _ => None,
-        };
-    }
-
-    if key.modifiers == KeyModifiers::CONTROL {
-        return match key.code {
-            KeyCode::Enter => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
-            KeyCode::Char('/') => Some(GlobalShortcut::Help),
-            KeyCode::Tab => Some(GlobalShortcut::Action(Action::FocusNext)),
-            KeyCode::BackTab => Some(GlobalShortcut::Action(Action::FocusPrev)),
-            _ => None,
-        };
-    }
-
-    if key.modifiers == KeyModifiers::ALT {
-        return match key.code {
-            KeyCode::Enter => Some(GlobalShortcut::Action(Action::OpenCommandPalette)),
-            KeyCode::Char('/') => Some(GlobalShortcut::Help),
-            KeyCode::Tab => Some(GlobalShortcut::Action(Action::FocusNext)),
-            KeyCode::BackTab => Some(GlobalShortcut::Action(Action::FocusPrev)),
-            _ => None,
-        };
-    }
-
-    if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
-        return match key.code {
-            KeyCode::Tab | KeyCode::BackTab => Some(GlobalShortcut::Action(Action::FocusPrev)),
-            _ => None,
-        };
-    }
-
-    None
+    keymap
+        .lookup_global(focused_is_viewer, key)
+        .map(BindAction::to_action)
 }
 
 fn apply_action(app: &mut RuntimeApp, action: Action) -> bool {
@@ -1466,7 +1428,7 @@ fn draw(frame: &mut Frame, app: &RuntimeApp) {
         draw_palette(frame, app, workspace);
     }
     if app.show_help {
-        draw_help(frame, workspace);
+        draw_help(frame, &app.keymap, workspace);
     }
 
     if !app.compact_chrome {
@@ -1565,7 +1527,7 @@ fn draw_palette(frame: &mut Frame, app: &RuntimeApp, workspace: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn draw_help(frame: &mut Frame, workspace: Rect) {
+fn draw_help(frame: &mut Frame, keymap: &Keymap, workspace: Rect) {
     let rect = overlay_rect(workspace, 86, 17);
     if rect.width < 20 || rect.height < 8 {
         return;
@@ -1579,27 +1541,98 @@ fn draw_help(frame: &mut Frame, workspace: Rect) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
+    // Key labels derive from the keymap so they cannot drift from dispatch. The two
+    // terminal-capability caveat rows stay hand-written so auto-generation never
+    // claims a Ctrl chord works on terminals that cannot send it.
     let lines = vec![
-        help_line("Ctrl+Enter", "commands", "open command palette"),
         help_line(
-            "Alt+Enter",
+            advertised_chord_label(keymap, BindAction::CommandPalette, false),
+            "commands",
+            "open command palette",
+        ),
+        help_line(
+            "Alt+Enter".to_string(),
             "commands",
             "fallback if Ctrl+Enter is not sent",
         ),
-        help_line("Ctrl+/", "help", "open this guide"),
-        help_line("click", "focus", "select a pane"),
-        help_line("Ctrl+Tab", "focus", "next pane if your terminal sends it"),
-        help_line("Shift+Tab", "focus", "previous pane in viewer panes"),
-        help_line("palette", "project", "open project picker or a new shell"),
-        help_line("palette", "reset", "collapse clutter to one project shell"),
-        help_line("F keys", "fallback", "F1 help, F2 commands, F10 quit"),
-        help_line("^Space", "leader", "legacy command prefix"),
-        help_line("Esc/Enter", "close", "close this help panel"),
+        help_line(
+            advertised_chord_label(keymap, BindAction::Help, false),
+            "help",
+            "open this guide",
+        ),
+        help_line("click".to_string(), "focus", "select a pane"),
+        help_line(
+            advertised_chord_label(keymap, BindAction::FocusNext, false),
+            "focus",
+            "next pane if your terminal sends it",
+        ),
+        help_line(
+            "Shift+Tab".to_string(),
+            "focus",
+            "previous pane in viewer panes",
+        ),
+        help_line(
+            "palette".to_string(),
+            "project",
+            "open project picker or a new shell",
+        ),
+        help_line(
+            "palette".to_string(),
+            "reset",
+            "collapse clutter to one project shell",
+        ),
+        help_line(f_key_summary(keymap), "fallback", "function-key shortcuts"),
+        help_line("^Space".to_string(), "leader", "legacy command prefix"),
+        help_line("Esc/Enter".to_string(), "close", "close this help panel"),
     ];
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn help_line(key: &'static str, label: &'static str, detail: &'static str) -> Line<'static> {
+/// A compact summary of the bound function-key globals (e.g. "F1 help, F2
+/// commands, F10 quit"), derived from the table so it tracks rebinds.
+fn f_key_summary(keymap: &Keymap) -> String {
+    let mut parts = Vec::new();
+    for (chord, binding) in keymap.global_entries() {
+        if let Chord::Global(KeyCode::F(_), KeyModifiers::NONE) = chord {
+            parts.push(format!(
+                "{} {}",
+                chord_label(chord),
+                bind_action_word(binding.action)
+            ));
+            if parts.len() == 3 {
+                break;
+            }
+        }
+    }
+    parts.join(", ")
+}
+
+/// A one-word description of a bindable action for compact help summaries.
+fn bind_action_word(action: BindAction) -> &'static str {
+    match action {
+        BindAction::Help => "help",
+        BindAction::CommandPalette => "commands",
+        BindAction::ProjectPalette => "projects",
+        BindAction::Viewer => "viewer",
+        BindAction::Shell => "shell",
+        BindAction::FocusNext => "next",
+        BindAction::FocusPrev => "prev",
+        BindAction::Zoom => "zoom",
+        BindAction::Close => "close",
+        BindAction::Quit => "quit",
+        BindAction::SplitHorizontal => "split",
+        BindAction::SplitVertical => "split",
+        BindAction::Restart => "restart",
+        BindAction::ResizeGrow => "grow",
+        BindAction::ResizeShrink => "shrink",
+        BindAction::Float => "float",
+        BindAction::ToggleStack => "stack",
+        BindAction::ToggleCompact => "compact",
+        BindAction::EditScrollback => "edit",
+    }
+}
+
+fn help_line(key: String, label: &'static str, detail: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled("  ", Style::default()),
         Span::styled(format!("{key:<8}"), Theme::selected_row()),
@@ -1751,25 +1784,60 @@ fn draw_statusline(frame: &mut Frame, app: &RuntimeApp, area: Rect) {
             StatusTone::Error => Theme::status_error(),
         };
         spans.push(sep());
-        spans.push(Span::styled(truncate_width(message, budget), style));
+        spans.push(Span::styled(truncate_width(&message, budget), style));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
+/// The advertised primary "commands … help" hint fragment, derived from the
+/// keymap. On macOS we advertise the Alt mirror as primary (Terminal.app cannot
+/// send Ctrl+Enter); elsewhere the Ctrl chord. Display only — never routing.
+fn primary_hint(keymap: &Keymap) -> String {
+    let advertise_alt = cfg!(target_os = "macos");
+    let commands = advertised_chord_label(keymap, BindAction::CommandPalette, advertise_alt);
+    let help = advertised_chord_label(keymap, BindAction::Help, advertise_alt);
+    format!("{commands} commands  {help} help")
+}
+
+/// Label for the chord advertised as the PRIMARY way to reach `action`: the
+/// Alt-modified mirror when `advertise_alt` is set (macOS), else the Ctrl-modified
+/// chord, falling back to the first bound global chord (e.g. an F-key) if neither
+/// exists. Display only — every chord stays routable regardless of what we show.
+fn advertised_chord_label(keymap: &Keymap, action: BindAction, advertise_alt: bool) -> String {
+    let preferred = if advertise_alt {
+        KeyModifiers::ALT
+    } else {
+        KeyModifiers::CONTROL
+    };
+    for (chord, binding) in keymap.global_entries() {
+        if binding.action == action
+            && let Chord::Global(_, modifiers) = chord
+            && modifiers.contains(preferred)
+        {
+            return chord_label(chord);
+        }
+    }
+    keymap
+        .global_chord_for(action)
+        .map(chord_label)
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn status_message(app: &RuntimeApp) -> (String, StatusTone) {
+    let hint = primary_hint(&app.keymap);
     if let Some(warning) = &app.config_warning {
         // Highest priority and shown even over the startup help, since a present
         // config that failed to parse is a state the user should fix. Cleared on
         // the first keypress (see `handle_key`).
-        (warning.as_str(), StatusTone::Error)
+        (warning.clone(), StatusTone::Error)
     } else if let Some(error) = &app.last_error {
-        (error.as_str(), StatusTone::Error)
+        (error.clone(), StatusTone::Error)
     } else if let Some(notice) = &app.last_notice {
-        (notice.as_str(), StatusTone::Notice)
+        (notice.clone(), StatusTone::Notice)
     } else if app.show_help {
         (
-            "startup guide  Ctrl+Enter commands  Ctrl+/ help  Esc close",
+            format!("startup guide  {hint}  Esc close"),
             StatusTone::Normal,
         )
     } else if matches!(
@@ -1780,32 +1848,53 @@ fn status_message(app: &RuntimeApp) -> (&str, StatusTone) {
         })
     ) {
         (
-            "status details  up/down inspect  enter/esc close",
+            "status details  up/down inspect  enter/esc close".to_string(),
             StatusTone::Normal,
         )
     } else if app.palette.is_some() {
-        ("enter run  up/down select  esc close", StatusTone::Normal)
+        (
+            "enter run  up/down select  esc close".to_string(),
+            StatusTone::Normal,
+        )
     } else if app.focused_is_viewer() {
         (
-            "viewer  j/k scroll  Tab focus  Ctrl+Enter commands  Ctrl+/ help",
+            format!("viewer  j/k scroll  Tab focus  {hint}"),
             StatusTone::Normal,
         )
     } else if app.input.mode_label() == "leader" {
-        (
-            "c commands  p projects  v viewer  s shell  h help  q quit",
-            StatusTone::Normal,
-        )
+        (leader_hint(&app.keymap), StatusTone::Normal)
     } else if app.focused_child_mouse_enabled() {
         (
-            "shell capture  mouse->child  Ctrl+Enter commands  Ctrl+/ help",
+            format!("shell capture  mouse->child  {hint}"),
             StatusTone::Normal,
         )
     } else {
         (
-            "click focus  Ctrl+Enter commands  Ctrl+/ help  ^Space leader",
+            format!("click focus  {hint}  ^Space leader"),
             StatusTone::Normal,
         )
     }
+}
+
+/// The leader-mode hint ("c commands  p projects  …"), derived from the leader
+/// table so a rebind is reflected here too.
+fn leader_hint(keymap: &Keymap) -> String {
+    let label = |action: BindAction| {
+        keymap
+            .leader_chord_for(action)
+            .map(chord_label)
+            .unwrap_or_else(|| "?".to_string())
+            .to_ascii_lowercase()
+    };
+    format!(
+        "{} commands  {} projects  {} viewer  {} shell  {} help  {} quit",
+        label(BindAction::CommandPalette),
+        label(BindAction::ProjectPalette),
+        label(BindAction::Viewer),
+        label(BindAction::Shell),
+        label(BindAction::Help),
+        label(BindAction::Quit),
+    )
 }
 
 fn pane_state(app: &RuntimeApp) -> String {
@@ -2250,47 +2339,129 @@ mod tests {
     fn global_shortcuts_keep_shell_typing_safe() {
         use ratatui::crossterm::event::KeyModifiers;
 
+        // Thread the default keymap and assert post-collapse Action values
+        // (GlobalShortcut::Help is now Action::OpenHelp).
+        let map = Keymap::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert_eq!(
-            global_shortcut(false, key(KeyCode::F(1))),
-            Some(GlobalShortcut::Help)
+            global_shortcut(&map, false, key(KeyCode::F(1))),
+            Some(Action::OpenHelp)
         );
         assert_eq!(
-            global_shortcut(false, key(KeyCode::F(2))),
-            Some(GlobalShortcut::Action(Action::OpenCommandPalette))
+            global_shortcut(&map, false, key(KeyCode::F(2))),
+            Some(Action::OpenCommandPalette)
         );
         assert_eq!(
-            global_shortcut(false, key(KeyCode::F(6))),
-            Some(GlobalShortcut::Action(Action::FocusNext))
+            global_shortcut(&map, false, key(KeyCode::F(6))),
+            Some(Action::FocusNext)
         );
         assert_eq!(
-            global_shortcut(false, key(KeyCode::F(10))),
-            Some(GlobalShortcut::Action(Action::Quit))
-        );
-        assert_eq!(
-            global_shortcut(false, KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
-            Some(GlobalShortcut::Action(Action::OpenCommandPalette))
+            global_shortcut(&map, false, key(KeyCode::F(10))),
+            Some(Action::Quit)
         );
         assert_eq!(
             global_shortcut(
+                &map,
+                false,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
+            ),
+            Some(Action::OpenCommandPalette)
+        );
+        assert_eq!(
+            global_shortcut(
+                &map,
                 false,
                 KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)
             ),
-            Some(GlobalShortcut::Help)
+            Some(Action::OpenHelp)
         );
         assert_eq!(
-            global_shortcut(false, KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
-            Some(GlobalShortcut::Action(Action::FocusNext))
+            global_shortcut(
+                &map,
+                false,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)
+            ),
+            Some(Action::FocusNext)
         );
-        assert_eq!(global_shortcut(false, key(KeyCode::Char('?'))), None);
-        assert_eq!(global_shortcut(false, key(KeyCode::Tab)), None);
+        // Shell-safety cases: plain '?', plain Tab, Shift+F2 fall through to typing.
+        assert_eq!(global_shortcut(&map, false, key(KeyCode::Char('?'))), None);
+        assert_eq!(global_shortcut(&map, false, key(KeyCode::Tab)), None);
+        // Viewer-Tab gating: Tab only fires FocusNext when a viewer is focused.
         assert_eq!(
-            global_shortcut(true, key(KeyCode::Tab)),
-            Some(GlobalShortcut::Action(Action::FocusNext))
+            global_shortcut(&map, true, key(KeyCode::Tab)),
+            Some(Action::FocusNext)
         );
         assert_eq!(
-            global_shortcut(false, KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT)),
+            global_shortcut(
+                &map,
+                false,
+                KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT)
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_only_bound_keys() {
+        // Anti-drift guard: the help key labels come from the keymap, so rebinding
+        // a global chord changes what the overlay advertises (never a stale string).
+        // The help overlay advertises the Ctrl chords as primary on every platform
+        // (the Alt row is a hand-written caveat).
+        let map = Keymap::default();
+        assert_eq!(
+            advertised_chord_label(&map, BindAction::CommandPalette, false),
+            "Ctrl+Enter"
+        );
+        assert_eq!(
+            advertised_chord_label(&map, BindAction::Help, false),
+            "Ctrl+/"
+        );
+        // FocusNext's Ctrl chord is Ctrl+Tab (the "if your terminal sends it" row).
+        assert_eq!(
+            advertised_chord_label(&map, BindAction::FocusNext, false),
+            "Ctrl+Tab"
+        );
+        // The function-key summary is derived, listing the first three NONE F-keys.
+        assert_eq!(f_key_summary(&map), "F1 help, F2 commands, F3 projects");
+    }
+
+    #[test]
+    fn status_hints_derive_from_chord_label() {
+        // Anti-drift guard for the statusline phrases: they are built from the
+        // keymap's chord labels, not hardcoded.
+        let map = Keymap::default();
+        let leader = leader_hint(&map);
+        assert!(leader.starts_with("c commands"), "{leader}");
+        assert!(leader.contains("h help"), "{leader}");
+        assert!(leader.contains("q quit"), "{leader}");
+        // The primary hint names the command-palette and help chords.
+        let hint = primary_hint(&map);
+        assert!(hint.contains("commands"), "{hint}");
+        assert!(hint.contains("help"), "{hint}");
+    }
+
+    #[test]
+    fn macos_advertises_alt_as_primary_fallback() {
+        let map = Keymap::default();
+        // advertise_alt=true picks the Alt mirror; false picks the Ctrl chord.
+        assert_eq!(
+            advertised_chord_label(&map, BindAction::CommandPalette, true),
+            "Alt+Enter"
+        );
+        assert_eq!(
+            advertised_chord_label(&map, BindAction::CommandPalette, false),
+            "Ctrl+Enter"
+        );
+        // The cfg!-driven primary hint matches the platform.
+        let expected = if cfg!(target_os = "macos") {
+            "Alt+Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+        assert!(
+            primary_hint(&map).starts_with(expected),
+            "{}",
+            primary_hint(&map)
         );
     }
 

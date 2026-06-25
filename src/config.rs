@@ -6,6 +6,7 @@
 //! defaults rather than crashing the TUI. The nav list is either the pinned
 //! `projects` (verbatim) or discovered from `projects_root`.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 
+use crate::keymap::{self, Keymap};
 use crate::layout::SplitDir;
 use crate::xdg;
 
@@ -39,6 +41,9 @@ pub struct Config {
     pub shell: ShellCfg,
     /// Input settings: command leader and future keymap surface.
     pub input: InputCfg,
+    /// Sparse keymap overlay: per-table `chord = action` maps that override the
+    /// built-in defaults. Resolved post-parse into [`Config::keymap`].
+    pub keymap: KeymapCfg,
     /// Workflow defaults for startup project and contextual viewer documents.
     pub workflow: WorkflowCfg,
     /// Raw `[[layouts]]` tables, kept as untyped values so a malformed layout
@@ -50,6 +55,10 @@ pub struct Config {
     /// [`from_toml_with_warning`] from [`raw_layouts`]; never set by serde.
     #[serde(skip)]
     pub layouts: Vec<NamedLayout>,
+    /// Resolved keymap (default table + sparse overlay). Populated by
+    /// [`from_toml_with_warning`] via [`resolve_keymap`]; never set by serde.
+    #[serde(skip)]
+    pub resolved_keymap: Keymap,
 }
 
 impl Default for Config {
@@ -61,11 +70,25 @@ impl Default for Config {
             poll: PollCfg::default(),
             shell: ShellCfg::default(),
             input: InputCfg::default(),
+            keymap: KeymapCfg::default(),
             workflow: WorkflowCfg::default(),
             raw_layouts: Vec::new(),
             layouts: Vec::new(),
+            resolved_keymap: Keymap::default(),
         }
     }
+}
+
+/// Sparse keymap overlay. Two `chord = action` maps mirror the two physical
+/// dispatch tables. Unspecified chords keep the built-in default; a user entry
+/// for a chord replaces that chord's binding (intended override, not a warning).
+/// `BTreeMap<String,String>` is valid here because `String: Ord`; the resolved
+/// keymap itself stores `Vec<(Chord, Binding)>` (crossterm types lack `Ord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct KeymapCfg {
+    pub global: BTreeMap<String, String>,
+    pub leader: BTreeMap<String, String>,
 }
 
 /// A named, ordered SCRIPT of split/focus steps applied at runtime. Replayed
@@ -330,7 +353,15 @@ impl Config {
     fn from_toml_with_warning(path: &Path, text: &str) -> (Self, Option<String>) {
         match toml::from_str::<Self>(text) {
             Ok(mut cfg) => {
-                let warning = cfg.resolve_layouts();
+                let layout_warning = cfg.resolve_layouts();
+                let keymap_warning = cfg.resolve_keymap();
+                // Local ' | ' join: config is lower-level than runtime, so we do
+                // NOT reach up into runtime::merge_warnings to combine these two.
+                let warning = match (layout_warning, keymap_warning) {
+                    (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+                    (Some(a), None) => Some(a),
+                    (None, b) => b,
+                };
                 (cfg, warning)
             }
             Err(e) => {
@@ -363,6 +394,17 @@ impl Config {
         }
         self.layouts = resolved;
         first_warning
+    }
+
+    /// Build [`resolved_keymap`] from the built-in defaults plus the sparse
+    /// `[keymap]` overlay, returning a one-line warning naming the first offending
+    /// entry (unknown key, unknown action, or a duplicate within one table). The
+    /// rest of the bindings survive: a single typo never wedges the keymap.
+    fn resolve_keymap(&mut self) -> Option<String> {
+        let mut map = keymap::default_keymap();
+        let warning = map.merge_overlay(&self.keymap.global, &self.keymap.leader);
+        self.resolved_keymap = map;
+        warning
     }
 
     /// Parse TOML, falling back to defaults (with a logged warning) on any parse
@@ -709,6 +751,82 @@ mod tests {
         assert_eq!(cfg.layouts[0].name, "good");
         let warning = warning.expect("the bad layout must warn");
         assert!(warning.contains("bad"), "{warning}");
+    }
+
+    #[test]
+    fn keymap_override_replaces_one_binding_keeps_rest() {
+        use crate::keymap::BindAction;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let toml = r#"
+            [keymap.leader]
+            x = "quit"
+        "#;
+        let (cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        assert_eq!(warning, None);
+        let ev = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // 'x' now quits; 'q' still quits; the rest of the table is intact.
+        assert_eq!(
+            cfg.resolved_keymap.lookup_leader(ev(KeyCode::Char('x'))),
+            Some(BindAction::Quit)
+        );
+        assert_eq!(
+            cfg.resolved_keymap.lookup_leader(ev(KeyCode::Char('z'))),
+            Some(BindAction::Zoom)
+        );
+    }
+
+    #[test]
+    fn unknown_action_name_in_keymap_drops_entry_and_warns() {
+        let toml = r#"
+            [keymap.leader]
+            x = "frobnicate"
+        "#;
+        let (_cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        let warning = warning.expect("unknown action must warn");
+        assert!(warning.contains("frobnicate"), "{warning}");
+        assert!(!warning.contains('\n'), "one line: {warning}");
+    }
+
+    #[test]
+    fn unknown_key_name_in_keymap_drops_entry_and_warns() {
+        let toml = r#"
+            [keymap.leader]
+            notakey = "quit"
+        "#;
+        let (_cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        let warning = warning.expect("unknown key must warn");
+        assert!(warning.contains("notakey"), "{warning}");
+    }
+
+    #[test]
+    fn default_keymap_has_no_warning() {
+        // No [keymap] block at all: the resolved keymap is the built-in default and
+        // no warning is produced.
+        let (cfg, warning) =
+            Config::from_toml_with_warning(Path::new("/cfg/config.toml"), "projects_root = \"/x\"");
+        assert_eq!(warning, None);
+        assert_eq!(cfg.resolved_keymap, keymap::default_keymap());
+    }
+
+    #[test]
+    fn layout_and_keymap_warnings_join_into_one_line() {
+        // A bad layout AND a bad keymap entry: both warnings join with ' | ' in one
+        // line (the local config-side join, not runtime::merge_warnings).
+        let toml = r#"
+            [[layouts]]
+            name = "bad"
+            steps = [ { split = "horizontal", ratio = 0 } ]
+
+            [keymap.leader]
+            x = "frobnicate"
+        "#;
+        let (_cfg, warning) = Config::from_toml_with_warning(Path::new("/cfg/config.toml"), toml);
+        let warning = warning.expect("both warnings present");
+        assert!(warning.contains("bad"), "{warning}");
+        assert!(warning.contains("frobnicate"), "{warning}");
+        assert!(warning.contains(" | "), "joined: {warning}");
+        assert!(!warning.contains('\n'), "one line: {warning}");
     }
 
     #[test]
